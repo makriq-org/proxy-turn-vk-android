@@ -136,7 +136,7 @@ jobs:
               -alias "$ANDROID_KEY_ALIAS" |
             sed -n 's/^.*SHA256: //p' |
             head -n1 |
-            tr -d '[:space:]' |
+            tr -d '[:space:][:punct:]' |
             tr 'A-Z' 'a-z'
           )"
 
