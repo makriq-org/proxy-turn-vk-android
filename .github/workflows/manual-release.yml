@@ -115,6 +115,51 @@ jobs:
           cp "$APK_PATH" "$FINAL_APK"
           sha256sum "$FINAL_APK" > "${FINAL_APK}.sha256"
 
+      - name: Проверить подпись apk
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner"
+          APK_PATH="dist/qWDTT_${INPUT_TAG}.apk"
+
+          test -x "$APKSIGNER"
+          test -f "$APK_PATH"
+
+          EXPECTED_SHA256="$(
+            keytool -list -v \
+              -keystore "$GITHUB_WORKSPACE/release.keystore" \
+              -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+              -keypass "$ANDROID_KEY_PASSWORD" \
+              -alias "$ANDROID_KEY_ALIAS" |
+            sed -n 's/^.*SHA256: //p' |
+            head -n1 |
+            tr -d '[:space:]' |
+            tr 'A-Z' 'a-z'
+          )"
+
+          ACTUAL_SHA256="$(
+            "$APKSIGNER" verify --print-certs "$APK_PATH" |
+            sed -n 's/^Signer #1 certificate SHA-256 digest: //p' |
+            head -n1 |
+            tr -d '[:space:]' |
+            tr 'A-Z' 'a-z'
+          )"
+
+          if [ -z "$EXPECTED_SHA256" ] || [ -z "$ACTUAL_SHA256" ]; then
+            echo "Не удалось определить отпечаток сертификата" >&2
+            exit 1
+          fi
+
+          if [ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]; then
+            echo "APK подписан не тем ключом" >&2
+            echo "Ожидался: $EXPECTED_SHA256" >&2
+            echo "Получен:   $ACTUAL_SHA256" >&2
+            exit 1
+          fi
+
       - name: Сохранить артефакты процесса
         uses: actions/upload-artifact@v4
         with:
