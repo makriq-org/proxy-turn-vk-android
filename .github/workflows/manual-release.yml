@@ -66,7 +66,7 @@ jobs:
 
           {
             printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT"
-            printf 'KEYSTORE_FILE=release.keystore\n'
+            printf 'KEYSTORE_FILE=../release.keystore\n'
             printf 'KEYSTORE_PASSWORD=%s\n' "$ANDROID_KEYSTORE_PASSWORD"
             printf 'KEY_ALIAS=%s\n' "$ANDROID_KEY_ALIAS"
             printf 'KEY_PASSWORD=%s\n' "$ANDROID_KEY_PASSWORD"
