@@ -174,7 +174,7 @@ qwdtt://config?name=Дом&peer=1.2.3.4:56000&hashes=хеш1,хеш2&workers=18&
 
 ## Быстрый старт
 
-1. APK из [релизов](https://github.com/SpaceNeuroX/proxy-turn-vk-android/releases) или сборка ниже.
+1. APK из [релизов](https://github.com/makriq-org/proxy-turn-vk-android/releases) или сборка ниже.
 2. Сервер: вкладка **Деплой** или уже настроенный VPS с `wdtt-server`.
 3. VK: групповой звонок → ссылка `vk.com/call/join/…` или только хеш после `/join/`.
 4. Импорт: вставьте `wdtt://…` / `qwdtt://…`, QR или заполните профиль вручную.
@@ -211,6 +211,8 @@ export ANDROID_NDK_HOME=/path/to/android-ndk
 
 Одна ABI: `./scripts/build-go-lib.sh arm64-v8a`
 
+Для ручного выпуска в GitHub Actions используйте [`.github/workflows/manual-release.yml`](.github/workflows/manual-release.yml). Он запускается вручную, собирает подписанный `apk` и создаёт выпуск с выбранной меткой.
+
 ---
 
 ## Структура репозитория
@@ -232,4 +234,4 @@ scripts/       Сборка Go под Android ABI
 
 ## Происхождение
 
-Форк [proxy-turn-vk-android](https://github.com/amurcanov/proxy-turn-vk-android) (автор **amurcanov**). Протокол и сервер общие; клиентская часть переработана под профили, импорт и удобство повседневного использования. Разработка форка — [SpaceNeuroX/proxy-turn-vk-android](https://github.com/SpaceNeuroX/proxy-turn-vk-android).
+Форк [proxy-turn-vk-android](https://github.com/amurcanov/proxy-turn-vk-android) (автор **amurcanov**). Протокол и сервер общие; клиентская часть переработана под профили, импорт и удобство повседневного использования. Сопровождаемый буферный репозиторий — [makriq-org/proxy-turn-vk-android](https://github.com/makriq-org/proxy-turn-vk-android).
