@@ -213,6 +213,8 @@ export ANDROID_NDK_HOME=/path/to/android-ndk
 
 Для ручного выпуска в GitHub Actions используйте [`.github/workflows/manual-release.yml`](.github/workflows/manual-release.yml). Он запускается вручную, собирает подписанный `apk` и создаёт выпуск с выбранной меткой.
 
+Обновление из `SpaceNeuroX/master` оформляется pull request командой `./scripts/update-upstream.sh`.
+
 ---
 
 ## Структура репозитория
