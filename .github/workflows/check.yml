@@ -41,6 +41,17 @@ jobs:
       - name: Запустить испытания
         run: |
           chmod +x gradlew scripts/*.sh
+          go mod download
+          (cd go_client && go mod download)
           go test ./...
           (cd go_client && go test ./...)
           ./gradlew --no-daemon :app:testDebugUnitTest
+
+  server-container:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Получить код
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Собрать образ сервера
+        run: docker build --tag wdtt-server:check --file docker/wdtt/Dockerfile .

@@ -137,7 +137,7 @@ jobs:
             sed -n 's/^.*SHA256: //p' |
             head -n1 |
             tr -d '[:space:][:punct:]' |
-            tr 'A-Z' 'a-z'
+            tr '[:upper:]' '[:lower:]'
           )"
 
           ACTUAL_SHA256="$(
@@ -145,7 +145,7 @@ jobs:
             sed -n 's/^Signer #1 certificate SHA-256 digest: //p' |
             head -n1 |
             tr -d '[:space:]' |
-            tr 'A-Z' 'a-z'
+            tr '[:upper:]' '[:lower:]'
           )"
 
           if [ -z "$EXPECTED_SHA256" ] || [ -z "$ACTUAL_SHA256" ]; then
