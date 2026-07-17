@@ -12,6 +12,9 @@ local.properties
 app/build/
 app/release/
 
+# ===== Go =====
+go.sum
+
 # ===== Native Libraries (compiled) =====
 *.so
 *.dll
@@ -48,4 +51,3 @@ Desktop.ini
 *.bak
 msg.txt
 *.bat
-.codex-secrets/

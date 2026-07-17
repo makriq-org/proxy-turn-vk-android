@@ -95,9 +95,9 @@ import kotlin.math.min
 import kotlin.math.sin
 
 private const val ReleasesUrl = "https://github.com/makriq-org/proxy-turn-vk-android/releases"
-private const val IssuesUrl = "https://github.com/makriq-org/proxy-turn-vk-android/issues/new"
-private const val DeveloperProfileUrl = "https://github.com/makriq-org"
-private const val RepositoryUrl = "https://github.com/makriq-org/proxy-turn-vk-android"
+private const val IssuesUrl = "https://github.com/SpaceNeuroX/proxy-turn-vk-android/issues/new"
+private const val DeveloperProfileUrl = "https://github.com/SpaceNeuroX"
+private const val RepositoryUrl = "https://github.com/SpaceNeuroX/proxy-turn-vk-android"
 private const val TelegramChannelUrl = "https://t.me/darkbitVPN"
 private const val DonateUrl = ""
 
