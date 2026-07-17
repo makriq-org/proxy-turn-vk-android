@@ -1,0 +1,191 @@
+name: Ручной выпуск
+# Ручной выпуск подписанного apk в публичный репозиторий.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Метка выпуска, например v1.2.5
+        required: true
+        type: string
+      notes:
+        description: Краткое описание выпуска
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Забрать код
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Настроить Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Настроить Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Настроить Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+
+      - name: Установить пакеты Android
+        run: |
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;36.0.0" \
+            "ndk;28.0.13004108"
+
+      - name: Подготовить подпись
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          test -n "$ANDROID_KEYSTORE_PASSWORD"
+          test -n "$ANDROID_KEY_ALIAS"
+          test -n "$ANDROID_KEY_PASSWORD"
+
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$GITHUB_WORKSPACE/release.keystore"
+
+          {
+            printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT"
+            printf 'KEYSTORE_FILE=../release.keystore\n'
+            printf 'KEYSTORE_PASSWORD=%s\n' "$ANDROID_KEYSTORE_PASSWORD"
+            printf 'KEY_ALIAS=%s\n' "$ANDROID_KEY_ALIAS"
+            printf 'KEY_PASSWORD=%s\n' "$ANDROID_KEY_PASSWORD"
+          } > "$GITHUB_WORKSPACE/local.properties"
+
+      - name: Проверить метку версии
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          VERSION_NAME="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n1)"
+          EXPECTED_TAG="v${VERSION_NAME#v}"
+
+          if [ -z "$VERSION_NAME" ]; then
+            echo "Не удалось определить versionName" >&2
+            exit 1
+          fi
+
+          if [ "$INPUT_TAG" != "$EXPECTED_TAG" ]; then
+            echo "Метка $INPUT_TAG не совпадает с versionName=$VERSION_NAME" >&2
+            echo "Ожидалась метка $EXPECTED_TAG" >&2
+            exit 1
+          fi
+
+      - name: Собрать release apk
+        run: |
+          chmod +x gradlew scripts/*.sh
+          ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Подготовить артефакты
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p dist
+
+          APK_PATH="$(find app/build/outputs/apk/release -type f -name '*universal*.apk' | sort | head -n1)"
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH="$(find app/build/outputs/apk/release -type f -name '*release.apk' | sort | head -n1)"
+          fi
+
+          if [ -z "$APK_PATH" ]; then
+            echo "Не найден release apk" >&2
+            exit 1
+          fi
+
+          FINAL_APK="dist/qWDTT_${INPUT_TAG}.apk"
+          cp "$APK_PATH" "$FINAL_APK"
+          sha256sum "$FINAL_APK" > "${FINAL_APK}.sha256"
+
+      - name: Проверить подпись apk
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner"
+          APK_PATH="dist/qWDTT_${INPUT_TAG}.apk"
+
+          test -x "$APKSIGNER"
+          test -f "$APK_PATH"
+
+          EXPECTED_SHA256="$(
+            keytool -list -v \
+              -keystore "$GITHUB_WORKSPACE/release.keystore" \
+              -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+              -keypass "$ANDROID_KEY_PASSWORD" \
+              -alias "$ANDROID_KEY_ALIAS" |
+            sed -n 's/^.*SHA256: //p' |
+            head -n1 |
+            tr -d '[:space:][:punct:]' |
+            tr '[:upper:]' '[:lower:]'
+          )"
+
+          ACTUAL_SHA256="$(
+            "$APKSIGNER" verify --print-certs "$APK_PATH" |
+            sed -n 's/^Signer #1 certificate SHA-256 digest: //p' |
+            head -n1 |
+            tr -d '[:space:]' |
+            tr '[:upper:]' '[:lower:]'
+          )"
+
+          if [ -z "$EXPECTED_SHA256" ] || [ -z "$ACTUAL_SHA256" ]; then
+            echo "Не удалось определить отпечаток сертификата" >&2
+            exit 1
+          fi
+
+          if [ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]; then
+            echo "APK подписан не тем ключом" >&2
+            echo "Ожидался: $EXPECTED_SHA256" >&2
+            echo "Получен:   $ACTUAL_SHA256" >&2
+            exit 1
+          fi
+
+      - name: Сохранить артефакты процесса
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-apk-${{ inputs.tag }}
+          path: dist/
+
+      - name: Создать выпуск
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_NOTES: ${{ inputs.notes }}
+        run: |
+          NOTES_FILE="$(mktemp)"
+          if [ -n "$INPUT_NOTES" ]; then
+            printf '%s\n' "$INPUT_NOTES" > "$NOTES_FILE"
+          else
+            {
+              printf 'Ручной выпуск %s.\n' "$INPUT_TAG"
+              printf 'Собрано и подписано в GitHub Actions.\n'
+            } > "$NOTES_FILE"
+          fi
+
+          gh release create "$INPUT_TAG" \
+            "dist/qWDTT_${INPUT_TAG}.apk" \
+            "dist/qWDTT_${INPUT_TAG}.apk.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "qWDTT $INPUT_TAG" \
+            --notes-file "$NOTES_FILE"
