@@ -32,9 +32,10 @@ object DeployManager {
 
     fun getErrorsFile(): File? = errorsFile
 
-    /** Записать ошибку в файл (потокобезопасно) */
+    /** Записать ошибку в файл (потокобезопасно) и во вкладку «Логи» */
     @Synchronized
     fun writeError(msg: String) {
+        TunnelManager.addDeployErrorLog(msg)
         val file = errorsFile ?: return
         try {
             val timestamp = dateFormat.format(Date())
@@ -59,12 +60,23 @@ object DeployManager {
         deployProgress.value = 0f
         currentStep.value = "Инициализация..."
         lastResult.value = ""
+        TunnelManager.addDeployLog("Старт установки…")
     }
 
     fun stopDeploy(result: String = "") {
         isDeploying.value = false
         deployStartTime = 0L
         if (result.isNotBlank()) lastResult.value = result
+        if (result.isNotBlank() && !result.equals("success", ignoreCase = true)) {
+            if (result.startsWith("error", ignoreCase = true) ||
+                result.startsWith("Ошибка", ignoreCase = true) ||
+                result.startsWith("Нужна", ignoreCase = true)
+            ) {
+                TunnelManager.addDeployErrorLog(result)
+            } else {
+                TunnelManager.addDeployLog(result)
+            }
+        }
         val session = activeSession
         activeSession = null
         try { session?.disconnect() } catch (_: Exception) {}
@@ -84,5 +96,8 @@ object DeployManager {
     fun updateProgress(progress: Float, step: String) {
         deployProgress.value = progress
         currentStep.value = step
+        if (step.isNotBlank()) {
+            TunnelManager.addDeployLog(step)
+        }
     }
 }

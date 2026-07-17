@@ -39,8 +39,9 @@ var (
 	reCaptchaV2DebugInfo  = regexp.MustCompile(`debug_info:(?:[^"]*\|\|)?"([a-fA-F0-9]{64})"`)
 	reCaptchaV2Version    = regexp.MustCompile(`vkid/([0-9.]*)/not_robot_captcha\.js`)
 
-	errCaptchaV2RateLimit = errors.New("captcha session rate limit reached")
-	errCaptchaV2Bot       = errors.New("captcha bot challenge")
+	errCaptchaV2RateLimit      = errors.New("captcha session rate limit reached")
+	errCaptchaV2Bot            = errors.New("captcha bot challenge")
+	errCaptchaSessionExpired     = errors.New("captcha session expired, need fresh challenge")
 
 	captchaV2MaxAttempts = 2
 	captchaV2MaxSliderChecks = 2
@@ -103,10 +104,11 @@ func (e *captchaV2ShowTypeError) Error() string {
 }
 
 type captchaV2Session struct {
-	ctx          context.Context
-	client       tlsclient.HttpClient
-	profile      Profile
-	savedProfile *SavedProfile
+	ctx              context.Context
+	client           tlsclient.HttpClient
+	profile          Profile
+	savedProfile     *SavedProfile
+	variedDeviceJSON string
 }
 
 func solveVkCaptchaV2(
@@ -138,6 +140,7 @@ func solveVkCaptchaV2Attempts(
 	s := &captchaV2Session{ctx: ctx, client: client, profile: profile, savedProfile: savedProfile}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		rotateCaptchaV2Identity(s, savedProfile)
 		token, solveErr := s.solveOnce(captchaErr)
 		if solveErr == nil {
 			return token, nil
@@ -200,12 +203,16 @@ func (s *captchaV2Session) solveOnce(captchaErr *VkCaptchaError) (string, error)
 		return "", fmt.Errorf("captcha settings failed: %w", settingsErr)
 	}
 
-	browserFP, err := captchaV2BrowserFP()
-	if err != nil {
-		return "", err
+	browserFP := ""
+	if s.savedProfile != nil {
+		browserFP = strings.TrimSpace(s.savedProfile.BrowserFp)
 	}
-	if s.savedProfile != nil && strings.TrimSpace(s.savedProfile.BrowserFp) != "" {
-		browserFP = s.savedProfile.BrowserFp
+	if browserFP == "" {
+		var err error
+		browserFP, err = captchaV2BrowserFP()
+		if err != nil {
+			return "", err
+		}
 	}
 
 	if m := reCaptchaV2Version.FindStringSubmatch(page.ScriptURL); len(m) > 1 {
@@ -264,6 +271,15 @@ func captchaV2BaseValues(sessionToken string) [][2]string {
 	}
 }
 
+func isCaptchaSessionDead(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "getcontent status:") ||
+		strings.Contains(msg, "error_limit")
+}
+
 func isCaptchaSessionExhausted(err error) bool {
 	if err == nil {
 		return false
@@ -272,8 +288,7 @@ func isCaptchaSessionExhausted(err error) bool {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "getcontent status:") ||
-		strings.Contains(msg, "error_limit") ||
+	return isCaptchaSessionDead(err) ||
 		strings.Contains(msg, "rate limit")
 }
 
@@ -282,6 +297,91 @@ func captchaV2DeviceJSON(savedProfile *SavedProfile) string {
 		return savedProfile.DeviceJSON
 	}
 	return captchaV2DeviceInfo
+}
+
+func (s *captchaV2Session) deviceJSON() string {
+	if strings.TrimSpace(s.variedDeviceJSON) != "" {
+		return s.variedDeviceJSON
+	}
+	return captchaV2DeviceJSON(s.savedProfile)
+}
+
+// rotateCaptchaV2Identity — новый browser_fp, UA и device_json на каждую попытку v2.
+func rotateCaptchaV2Identity(s *captchaV2Session, base *SavedProfile) {
+	s.profile = getRandomProfile()
+	fp, err := captchaV2BrowserFP()
+	if err != nil {
+		log.Printf("[КАПЧА] v2 fp generate failed: %v", err)
+		return
+	}
+	if s.savedProfile == nil {
+		s.savedProfile = &SavedProfile{}
+	}
+	s.savedProfile.Profile = s.profile
+	s.savedProfile.BrowserFp = fp
+	s.variedDeviceJSON = captchaV2VariedDeviceJSON(captchaV2DeviceJSON(base))
+	short := fp
+	if len(short) > 8 {
+		short = fp[:8]
+	}
+	log.Printf("[КАПЧА] v2 identity rotated fp=%s... ua=%s", short, truncateUA(s.profile.UserAgent))
+}
+
+func truncateUA(ua string) string {
+	if len(ua) <= 48 {
+		return ua
+	}
+	return ua[:48] + "..."
+}
+
+func captchaV2VariedDeviceJSON(base string) string {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(base), &m); err != nil {
+		return base
+	}
+	jitterInt := func(key string, delta int) {
+		v, ok := m[key].(float64)
+		if !ok {
+			return
+		}
+		n := int(v) + mathrand.Intn(delta*2+1) - delta
+		if n < 320 {
+			n = 320
+		}
+		m[key] = n
+	}
+	jitterInt("screenWidth", 18)
+	jitterInt("screenHeight", 24)
+	jitterInt("screenAvailWidth", 18)
+	jitterInt("screenAvailHeight", 24)
+	jitterInt("innerWidth", 18)
+	jitterInt("innerHeight", 20)
+	if dpr, ok := m["devicePixelRatio"].(float64); ok && mathrand.Intn(3) == 0 {
+		m["devicePixelRatio"] = dpr
+	} else {
+		opts := []float64{1, 1.25, 1.5, 2, 2.5, 3}
+		m["devicePixelRatio"] = opts[mathrand.Intn(len(opts))]
+	}
+	m["hardwareConcurrency"] = 4 + mathrand.Intn(5)
+	langs := [][]string{
+		{"ru-RU", "ru", "en-US"},
+		{"ru-RU", "ru"},
+		{"en-US", "en", "ru-RU"},
+	}
+	pick := langs[mathrand.Intn(len(langs))]
+	m["language"] = pick[0]
+	langArr := make([]any, len(pick))
+	for i, l := range pick {
+		langArr[i] = l
+	}
+	m["languages"] = langArr
+	perms := []string{"default", "denied", "granted"}
+	m["notificationsPermission"] = perms[mathrand.Intn(len(perms))]
+	out, err := json.Marshal(m)
+	if err != nil {
+		return base
+	}
+	return string(out)
 }
 
 func captchaV2AcceptLanguage(profile Profile) string {
@@ -454,7 +554,7 @@ func (s *captchaV2Session) solveCheckboxCaptcha(
 	hash string,
 	debugInfo string,
 ) (string, error) {
-	deviceJSON := captchaV2DeviceJSON(s.savedProfile)
+	deviceJSON := s.deviceJSON()
 	if _, err := s.captchaRequest("captchaNotRobot.componentDone", [][2]string{
 		{"session_token", sessionToken},
 		{"domain", "vk.com"},

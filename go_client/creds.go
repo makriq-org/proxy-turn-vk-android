@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
 	neturl "net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +33,66 @@ type VKCredentials struct {
 var vkCredentialsList = []VKCredentials{
 	{ClientID: "6287487", ClientSecret: "MuAxFaKDYDOICzGnEOhp"},
 	{ClientID: "8202606", ClientSecret: "lMRsTiMCyPnp5vfoldmn"},
+}
+
+// CallUnavailableError is a non-retryable VK error about the call/link itself:
+// the call was ended/deleted or the join link is invalid. Retrying another
+// client_id or solving captcha cannot fix this.
+type CallUnavailableError struct {
+	Code    int
+	Message string
+}
+
+func (e *CallUnavailableError) Error() string {
+	if e == nil {
+		return "VK call is unavailable"
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("VK returns error: %s (error_code=%d)", e.Message, e.Code)
+	}
+	return fmt.Sprintf("VK call is unavailable (error_code=%d)", e.Code)
+}
+
+func asCallUnavailableError(err error) (*CallUnavailableError, bool) {
+	var callErr *CallUnavailableError
+	if errors.As(err, &callErr) {
+		return callErr, true
+	}
+	return nil, false
+}
+
+func fatalCallError(resp map[string]interface{}) *CallUnavailableError {
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	code := vkErrorCode(errObj["error_code"])
+	switch {
+	case code == 951, code == 954:
+		// VKCalls messages.*: call not found / invalid join link.
+	case code >= 9000 && code <= 9999:
+		// Legacy calls.getAnonymousToken call-domain errors.
+	default:
+		return nil
+	}
+
+	msg, _ := errObj["error_msg"].(string)
+	return &CallUnavailableError{Code: code, Message: msg}
+}
+
+func vkErrorCode(raw interface{}) int {
+	switch v := raw.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case string:
+		n, _ := strconv.Atoi(v)
+		return n
+	default:
+		return 0
+	}
 }
 
 const vkCredentialAttemptLimit = 4
@@ -253,6 +315,10 @@ func fetchVkCreds(ctx context.Context, link string, streamID int) (string, strin
 			log.Printf("[STREAM %d] [VK Auth] Success via VK Calls path", streamID)
 			return user, pass, addrs, nil
 		} else {
+			if callErr, ok := asCallUnavailableError(err); ok {
+				log.Printf("[STREAM %d] [VK Auth] VK Calls path returned non-retryable call error: %v", streamID, callErr)
+				return "", "", nil, callErr
+			}
 			log.Printf("[STREAM %d] [VK Auth] VK Calls path failed (%s), falling back to legacy", streamID, describeVKCallsFailure(err))
 		}
 	} else {
@@ -275,6 +341,10 @@ func fetchVkCreds(ctx context.Context, link string, streamID int) (string, strin
 
 		lastErr = err
 		log.Printf("[STREAM %d] [VK Auth] Failed with client_id=%s: %v", streamID, creds.ClientID, err)
+
+		if callErr, ok := asCallUnavailableError(err); ok {
+			return "", "", nil, callErr
+		}
 
 		if strings.Contains(err.Error(), "CAPTCHA_WAIT_REQUIRED") || strings.Contains(err.Error(), "FATAL_CAPTCHA") {
 			return "", "", nil, err
@@ -385,15 +455,19 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 
 	// Step 2: getCallPreview (mimics real VK client behavior)
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&fields=photo_200&access_token=%s", link, token1)
-	_, err = doRequest(data, "https://api.vk.ru/method/calls.getCallPreview?v=5.275&client_id="+creds.ClientID)
+	resp, err = doRequest(data, "https://api.vk.ru/method/calls.getCallPreview?v=5.275&client_id="+creds.ClientID)
 	if err != nil {
 		log.Printf("[STREAM %d] [VK Auth] Warning: getCallPreview failed: %v", streamID, err)
+	} else if callErr := fatalCallError(resp); callErr != nil {
+		log.Printf("[STREAM %d] [VK Auth] getCallPreview returned non-retryable call error: %v", streamID, callErr)
+		return "", "", nil, callErr
 	}
 
 	vkDelayRandom(200, 400)
 
 	// Step 3: getAnonymousToken (with captcha handling)
-	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
+	originalData := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
+	data = originalData
 	urlAddr := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id=%s", creds.ClientID)
 
 	var token2 string
@@ -407,6 +481,11 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 		}
 
 		if errObj, hasErr := resp["error"].(map[string]interface{}); hasErr {
+			if callErr := fatalCallError(resp); callErr != nil {
+				log.Printf("[STREAM %d] [VK Auth] getAnonymousToken returned non-retryable call error: %v", streamID, callErr)
+				return "", "", nil, callErr
+			}
+
 			captchaErr := parseVkCaptchaError(errObj)
 			if captchaErr != nil && captchaErr.RedirectURI != "" && captchaErr.SessionToken != "" {
 				if attempt >= 3 {
@@ -417,6 +496,13 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 
 				successToken, solveErr := solveCaptchaBySelectedMode(ctx, streamID, attempt+1, captchaErr, client, profile, savedProfile)
 				if solveErr != nil {
+					if errors.Is(solveErr, errCaptchaSessionExpired) {
+						log.Printf("[STREAM %d] [КАПЧА] сессия исчерпана — запрос новой капчи у VK", streamID)
+						savedProfile, _ = LoadProfileFromDisk()
+						data = originalData
+						vkDelayRandom(800, 1500)
+						continue
+					}
 					log.Printf("[STREAM %d] [Captcha] Solve failed: %v", streamID, solveErr)
 					globalCaptchaLockout.Store(time.Now().Add(60 * time.Second).Unix())
 					return "", "", nil, fmt.Errorf("CAPTCHA_WAIT_REQUIRED")
@@ -506,6 +592,15 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 	return user, pass, addresses, nil
 }
 
+func markCaptchaSessionExpired(streamID int) error {
+	if _, err := rotateCaptchaBrowserFP(); err != nil {
+		log.Printf("[STREAM %d] [КАПЧА] не удалось обновить browser_fp: %v", streamID, err)
+	} else {
+		log.Printf("[STREAM %d] [КАПЧА] browser_fp обновлён после исчерпания сессии", streamID)
+	}
+	return errCaptchaSessionExpired
+}
+
 func solveCaptchaBySelectedMode(
 	ctx context.Context,
 	streamID int,
@@ -515,6 +610,12 @@ func solveCaptchaBySelectedMode(
 	profile Profile,
 	savedProfile *SavedProfile,
 ) (string, error) {
+	if fresh, err := rotateCaptchaProfile(); err == nil {
+		savedProfile = fresh
+	} else {
+		log.Printf("[STREAM %d] [КАПЧА] profile rotate failed: %v", streamID, err)
+	}
+
 	switch getCaptchaMode() {
 	case "wv":
 		log.Printf("[STREAM %d] [КАПЧА] WBV: режим из настроек Android (attempt %d)", streamID, attempt)
@@ -528,8 +629,12 @@ func solveCaptchaBySelectedMode(
 		if ctx.Err() != nil {
 			return "", solveErr
 		}
+		if isCaptchaSessionDead(solveErr) {
+			log.Printf("[STREAM %d] [КАПЧА] RJS: сессия капчи мёртва, запрашиваем новую у VK", streamID)
+			return "", markCaptchaSessionExpired(streamID)
+		}
 		if isCaptchaSessionExhausted(solveErr) {
-			log.Printf("[STREAM %d] [КАПЧА] RJS: сессия капчи исчерпана, открываем WebView", streamID)
+			log.Printf("[STREAM %d] [КАПЧА] RJS: rate limit, fallback на WBV Auto", streamID)
 			return requestWebViewCaptcha(streamID, captchaErr, "auto", captchaAutoWebViewTimeout)
 		}
 		log.Printf("[STREAM %d] [КАПЧА] RJS: ошибка, fallback на WBV Auto: %v", streamID, solveErr)
@@ -547,13 +652,12 @@ func solveCaptchaBySelectedMode(
 		return "", solveErr
 	}
 	lastErr := solveErr
-	if isCaptchaSessionExhausted(solveErr) {
-		log.Printf("[STREAM %d] [КАПЧА] AUTO: сессия капчи исчерпана, сразу ручной WebView", streamID)
-		token, solveErr = requestWebViewCaptcha(streamID, captchaErr, "manual", captchaManualWebViewTimeout)
-		if solveErr == nil {
-			return token, nil
-		}
-		return "", solveErr
+	if isCaptchaSessionDead(solveErr) {
+		log.Printf("[STREAM %d] [КАПЧА] AUTO: сессия капчи мёртва, запрашиваем новую у VK", streamID)
+		return "", markCaptchaSessionExpired(streamID)
+	}
+	if errors.Is(solveErr, errCaptchaV2RateLimit) || strings.Contains(strings.ToLower(solveErr.Error()), "rate limit") {
+		log.Printf("[STREAM %d] [КАПЧА] AUTO: rate limit на Go v2, пробуем WBV", streamID)
 	}
 	log.Printf("[STREAM %d] [КАПЧА] AUTO: Go v2 не решил за 2 попытки: %v", streamID, solveErr)
 
@@ -673,18 +777,113 @@ func GetCreds(ctx context.Context, link string, streamID int) (string, string, [
 
 // ─── DNS dialer setup ───
 
-func setupGlobalResolver() {
+func goDNSServersForPreset(preset string) []string {
+	switch strings.ToLower(strings.TrimSpace(preset)) {
+	case "cloudflare":
+		return []string{"1.1.1.1:53", "1.0.0.1:53"}
+	case "google":
+		return []string{"8.8.8.8:53", "8.8.4.4:53"}
+	default:
+		return []string{"77.88.8.8:53", "77.88.8.1:53"}
+	}
+}
+
+func isLoopbackDNSAddress(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	host = strings.Trim(host, "[]")
+	return host == "127.0.0.1" || host == "::1" || host == "localhost" || host == "0.0.0.0"
+}
+
+func goDNSServersForArg(arg string) []string {
+	arg = strings.TrimSpace(arg)
+	if strings.HasPrefix(arg, "custom:") {
+		raw := strings.TrimPrefix(arg, "custom:")
+		var out []string
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if !strings.Contains(part, ":") {
+				part += ":53"
+			}
+			out = append(out, part)
+		}
+		if len(out) > 0 {
+			return out
+		}
+		return goDNSServersForPreset("yandex")
+	}
+	return goDNSServersForPreset(arg)
+}
+
+func goDNSLabel(arg string) string {
+	arg = strings.TrimSpace(arg)
+	if strings.HasPrefix(arg, "custom:") {
+		return "Свой DNS"
+	}
+	if strings.HasPrefix(arg, "doh:") {
+		return "Свой DoH"
+	}
+	switch strings.ToLower(arg) {
+	case "cloudflare":
+		return "Cloudflare"
+	case "google":
+		return "Google DNS"
+	case "doh-cloudflare":
+		return "Cloudflare DoH"
+	case "doh-google":
+		return "Google DoH"
+	case "doh-yandex":
+		return "Яндекс DoH"
+	default:
+		return "Яндекс DNS"
+	}
+}
+
+func formatGoDNSServers(servers []string) string {
+	parts := make([]string, 0, len(servers))
+	for _, s := range servers {
+		host, port, err := net.SplitHostPort(s)
+		if err != nil {
+			parts = append(parts, s)
+			continue
+		}
+		if port == "53" {
+			parts = append(parts, host)
+		} else {
+			parts = append(parts, s)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func setupGlobalResolver(arg string) {
+	arg = strings.TrimSpace(arg)
+	if goDNSIsDoH(arg) {
+		setupDoHResolver(arg, goDoHEndpointsForArg(arg))
+		return
+	}
+
 	dialer := &net.Dialer{
 		Timeout:   3 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	yandexDNSServers := []string{"77.88.8.8:53", "77.88.8.1:53"}
+	servers := goDNSServersForArg(arg)
+	log.Printf(
+		"[КЛИЕНТ] DNS для VK: %s (%s) — UDP/TCP :53",
+		goDNSLabel(arg),
+		formatGoDNSServers(servers),
+	)
 
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			var lastErr error
-			for _, dns := range yandexDNSServers {
+			for _, dns := range servers {
 				conn, err := dialer.DialContext(ctx, "udp", dns)
 				if err == nil {
 					return conn, nil
@@ -698,23 +897,17 @@ func setupGlobalResolver() {
 			}
 
 			address = strings.TrimSpace(address)
-			if address != "" && !isYandexDNSAddress(address) {
+			if address != "" && !isLoopbackDNSAddress(address) {
 				conn, err := dialer.DialContext(ctx, network, address)
 				if err == nil {
 					return conn, nil
 				}
 				lastErr = err
 			}
+			if lastErr == nil {
+				lastErr = fmt.Errorf("no DNS servers available for %q", arg)
+			}
 			return nil, lastErr
 		},
 	}
-}
-
-func isYandexDNSAddress(address string) bool {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		host = address
-	}
-	host = strings.Trim(host, "[]")
-	return host == "77.88.8.8" || host == "77.88.8.1"
 }

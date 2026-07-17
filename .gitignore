@@ -51,3 +51,6 @@ Desktop.ini
 *.bak
 msg.txt
 *.bat
+wdtt-server
+.kotlin/
+.keys/

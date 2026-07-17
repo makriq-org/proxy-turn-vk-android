@@ -65,17 +65,16 @@ object ManlCaptchaWebViewManager {
 
     private fun showCaptchaNotification(context: Context, redirectUri: String) {
         if (MainActivity.isForeground) return // Если юзер уже в приложении — не спамим пушом
+        if (!NotificationHelper.areNotificationsEnabled(context)) return
+
+        NotificationHelper.ensureAuxChannel(
+            context,
+            CHANNEL_ID,
+            "Уведомления защиты (Капча)",
+            "Запросы капчи VK при подключении",
+        )
         
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Уведомления защиты (Капча)",
-                NotificationManager.IMPORTANCE_HIGH
-            )
-            notificationManager.createNotificationChannel(channel)
-        }
 
         val openIntent = Intent(context, ManlCaptchaActivity::class.java).apply {
             putExtra("redirectUri", redirectUri)
@@ -111,6 +110,7 @@ object ManlCaptchaWebViewManager {
 
     suspend fun solveCaptchaAsync(context: Context, redirectUri: String, sessionToken: String): String {
         return captchaMutex.withLock {
+            VkWebViewCookies.clearCaptchaCookies()
             isCaptchaPending = true
             val deferred = CompletableDeferred<Result<String>>()
             // Если предыдущий вызов завис, отменяем его
@@ -309,7 +309,7 @@ class ManlCaptchaActivity : ComponentActivity() {
                                     useWideViewPort = true
                                     blockNetworkLoads = false
                                     cacheMode = WebSettings.LOAD_DEFAULT // Включаем кэш для моментальной загрузки!
-                                    userAgentString = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+                                    userAgentString = VkCaptchaWebViewUa.randomDesktop()
                                 }
 
                                 addJavascriptInterface(object {

@@ -45,12 +45,14 @@ object PingHelper {
             val defaultPort = if (manualPorts) store.serverDtlsPort.first() else 56000
             val peerWithPort = PeerAddress.ensurePort(profile.peer, defaultPort)
 
+            val goDnsArg = store.resolveGoDnsArg()
             val cmd = mutableListOf(
                 binaryPath,
                 "-ping-only",
                 "-peer", peerWithPort,
                 "-vk", firstHash,
-                "-password", profile.password
+                "-password", profile.password,
+                "-go-dns", goDnsArg,
             )
             android.util.Log.d("PingHelper", "Command: ${cmd.joinToString(" ") { if (it == profile.password) "***" else it }}")
 

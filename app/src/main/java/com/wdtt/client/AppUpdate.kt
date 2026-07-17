@@ -47,7 +47,17 @@ data class AppReleaseInfo(
     val versionTag: String,
     val releaseUrl: String,
     val source: RemoteVersionSource,
-    val downloadUrl: String? = null
+    val downloadUrl: String? = null,
+    val releaseNotes: String = "",
+    val isPrerelease: Boolean = false,
+)
+
+data class ReleaseChangelogItem(
+    val versionTag: String,
+    val publishedAt: String,
+    val body: String,
+    val isPrerelease: Boolean,
+    val releaseUrl: String,
 )
 
 enum class RemoteVersionSource {
@@ -55,36 +65,137 @@ enum class RemoteVersionSource {
     Tag
 }
 
-suspend fun fetchLatestReleaseInfo(localVersion: String? = null): AppReleaseInfo? = withContext(Dispatchers.IO) {
-    val latestRelease = fetchReleaseFromLatestWebRedirect()
-        ?: fetchReleaseFromLatestEndpoint()
-        ?: fetchLatestStableReleaseFromList()
-    val latestTag = fetchLatestTagFromList()
+suspend fun fetchLatestReleaseInfo(
+    localVersion: String? = null,
+    includePrerelease: Boolean = false,
+): AppReleaseInfo? = withContext(Dispatchers.IO) {
+    val latestRelease = fetchReleaseFromLatestWebRedirect(includePrerelease)
+        ?: fetchReleaseFromLatestEndpoint(includePrerelease)
+        ?: fetchLatestReleaseFromList(includePrerelease)
+    val latestTag = if (includePrerelease) null else fetchLatestTagFromList()
 
     when {
         latestRelease == null -> latestTag
         latestTag == null -> latestRelease
-        isNewerVersion(latestRelease.versionTag, latestTag.versionTag) -> latestTag
+        isNewerVersion(latestRelease.versionTag, latestTag.versionTag, includePrerelease) -> latestTag
         else -> latestRelease
     }
 }
 
-fun isNewerVersion(local: String, remote: String): Boolean {
-    val localParts = versionParts(local)
-    val remoteParts = versionParts(remote)
-    if (remoteParts.isEmpty()) return false
+suspend fun fetchReleaseChangelog(
+    includePrerelease: Boolean = false,
+    limit: Int = 12,
+): List<ReleaseChangelogItem> = withContext(Dispatchers.IO) {
+    val response = fetchGitHubApi(GITHUB_RELEASES_URL) ?: return@withContext emptyList()
+    val releases = try {
+        JSONArray(response)
+    } catch (e: Exception) {
+        Log.w(UPDATE_LOG_TAG, "[WARN] Changelog: failed to parse releases list", e)
+        return@withContext emptyList()
+    }
 
-    val maxLen = maxOf(localParts.size, remoteParts.size)
+    val items = mutableListOf<ReleaseChangelogItem>()
+    for (i in 0 until releases.length()) {
+        val json = releases.optJSONObject(i) ?: continue
+        if (json.optBoolean("draft")) continue
+        if (!includePrerelease && json.optBoolean("prerelease")) continue
+        val versionTag = normalizeVersionTag(json.optString("tag_name"))
+        val releaseUrl = json.optString("html_url").trim()
+        if (versionTag.isBlank() || releaseUrl.isBlank()) continue
+        items += ReleaseChangelogItem(
+            versionTag = versionTag,
+            publishedAt = json.optString("published_at").substringBefore("T"),
+            body = json.optString("body").trim(),
+            isPrerelease = json.optBoolean("prerelease"),
+            releaseUrl = releaseUrl,
+        )
+    }
+    items.take(limit)
+}
+
+suspend fun fetchReleaseNotesForVersion(versionTag: String): String = withContext(Dispatchers.IO) {
+    val normalized = normalizeVersionTag(versionTag)
+    val response = fetchGitHubApi(GITHUB_RELEASES_URL) ?: return@withContext bundledReleaseNotes(versionTag)
+    val releases = try {
+        JSONArray(response)
+    } catch (_: Exception) {
+        return@withContext bundledReleaseNotes(versionTag)
+    }
+    for (i in 0 until releases.length()) {
+        val json = releases.optJSONObject(i) ?: continue
+        if (normalizeVersionTag(json.optString("tag_name")) == normalized) {
+            return@withContext json.optString("body").trim().ifBlank { bundledReleaseNotes(versionTag) }
+        }
+    }
+    bundledReleaseNotes(versionTag)
+}
+
+fun bundledReleaseNotes(versionTag: String): String {
+    return when (normalizeVersionTag(versionTag)) {
+        "1.3.2" -> """
+            • SSH-ключ для деплоя на VPS
+            • Упрощён ввод IP — порт только в «Секретах»
+            • Кнопка «Подключить» сразу на экране туннеля
+            • Сторонний VPN не отключается при простом открытии приложения
+            • Опция «Отключать на Wi-Fi»
+            • Автогенерация VK-хешей при входе в аккаунт
+        """.trimIndent()
+        else -> ""
+    }
+}
+
+fun isNewerVersion(local: String, remote: String, includePrerelease: Boolean = false): Boolean {
+    val localParsed = parseVersionTag(local)
+    val remoteParsed = parseVersionTag(remote)
+    if (remoteParsed.core.isEmpty()) return false
+    if (localParsed.core.isEmpty()) return true
+
+    val maxLen = maxOf(localParsed.core.size, remoteParsed.core.size)
     for (i in 0 until maxLen) {
-        val localPart = localParts.getOrElse(i) { 0 }
-        val remotePart = remoteParts.getOrElse(i) { 0 }
+        val localPart = localParsed.core.getOrElse(i) { 0 }
+        val remotePart = remoteParsed.core.getOrElse(i) { 0 }
         if (remotePart > localPart) return true
         if (remotePart < localPart) return false
     }
-    return false
+
+    val localPre = localParsed.prerelease
+    val remotePre = remoteParsed.prerelease
+    if (localPre == null && remotePre == null) return false
+    if (localPre == null && remotePre != null) return includePrerelease
+    if (localPre != null && remotePre == null) return true
+    return comparePrerelease(remotePre!!, localPre!!) > 0
 }
 
-private fun fetchLatestStableReleaseFromList(): AppReleaseInfo? {
+private data class ParsedVersionTag(
+    val core: List<Int>,
+    val prerelease: String?,
+)
+
+private fun parseVersionTag(version: String): ParsedVersionTag {
+    val normalized = normalizeVersionTag(version).removePrefix("v").removePrefix("V")
+    val coreMatch = VERSION_NUMBER_REGEX.find(normalized)?.value ?: return ParsedVersionTag(emptyList(), null)
+    val core = coreMatch.split('.').mapNotNull { it.toIntOrNull() }
+    val suffix = normalized
+        .removePrefix(coreMatch)
+        .trim()
+        .trimStart('-')
+        .takeIf { it.isNotEmpty() }
+    return ParsedVersionTag(core, suffix)
+}
+
+private fun comparePrerelease(remote: String, local: String): Int {
+    val remoteNums = Regex("\\d+").findAll(remote).map { it.value.toInt() }.toList()
+    val localNums = Regex("\\d+").findAll(local).map { it.value.toInt() }.toList()
+    val max = maxOf(remoteNums.size, localNums.size)
+    for (i in 0 until max) {
+        val r = remoteNums.getOrElse(i) { 0 }
+        val l = localNums.getOrElse(i) { 0 }
+        if (r != l) return r.compareTo(l)
+    }
+    return remote.compareTo(local, ignoreCase = true)
+}
+
+private fun fetchLatestReleaseFromList(includePrerelease: Boolean): AppReleaseInfo? {
     val response = fetchGitHubApi(GITHUB_RELEASES_URL) ?: return null
     val releases = try {
         JSONArray(response)
@@ -96,9 +207,10 @@ private fun fetchLatestStableReleaseFromList(): AppReleaseInfo? {
     var bestRelease: AppReleaseInfo? = null
     for (i in 0 until releases.length()) {
         val json = releases.optJSONObject(i) ?: continue
-        if (json.optBoolean("draft") || json.optBoolean("prerelease")) continue
+        if (json.optBoolean("draft")) continue
+        if (!includePrerelease && json.optBoolean("prerelease")) continue
         val release = json.toAppReleaseInfo() ?: continue
-        if (bestRelease == null || isNewerVersion(bestRelease.versionTag, release.versionTag)) {
+        if (bestRelease == null || isNewerVersion(bestRelease.versionTag, release.versionTag, includePrerelease)) {
             bestRelease = release
         }
     }
@@ -132,7 +244,7 @@ private fun fetchLatestTagFromList(): AppReleaseInfo? {
     return bestTag
 }
 
-private fun fetchReleaseFromLatestEndpoint(): AppReleaseInfo? {
+private fun fetchReleaseFromLatestEndpoint(includePrerelease: Boolean): AppReleaseInfo? {
     val response = fetchGitHubApi(GITHUB_LATEST_RELEASE_URL) ?: return null
     val json = try {
         JSONObject(response)
@@ -140,10 +252,11 @@ private fun fetchReleaseFromLatestEndpoint(): AppReleaseInfo? {
         Log.w(UPDATE_LOG_TAG, "[WARN] Update check: failed to parse latest release", e)
         return null
     }
+    if (!includePrerelease && json.optBoolean("prerelease")) return null
     return json.toAppReleaseInfo()
 }
 
-private fun fetchReleaseFromLatestWebRedirect(): AppReleaseInfo? {
+private fun fetchReleaseFromLatestWebRedirect(includePrerelease: Boolean): AppReleaseInfo? {
     var conn: HttpURLConnection? = null
     return try {
         conn = URL(GITHUB_LATEST_RELEASE_WEB_URL).openConnection() as HttpURLConnection
@@ -276,7 +389,14 @@ private fun JSONObject.toAppReleaseInfo(): AppReleaseInfo? {
         }
     }
     
-    return AppReleaseInfo(versionTag, releaseUrl, RemoteVersionSource.Release, downloadUrl)
+    return AppReleaseInfo(
+        versionTag,
+        releaseUrl,
+        RemoteVersionSource.Release,
+        downloadUrl,
+        releaseNotes = optString("body").trim(),
+        isPrerelease = optBoolean("prerelease"),
+    )
 }
 
 private fun versionParts(version: String): List<Int> {

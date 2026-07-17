@@ -1,6 +1,7 @@
 package com.wdtt.client
 
 import android.content.Context
+import android.content.pm.PackageManager
 import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
@@ -9,18 +10,31 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class SettingsStore(context: Context) {
     private val appContext = context.applicationContext
     companion object {
         /** Макс. потоков при входе через аккаунт VK (лимит TURN relay на звонок). */
         const val VK_ACCOUNT_MAX_WORKERS = 4
+        /** Потоков в одной группе Go-клиента (workersPerGroup). */
+        const val WORKERS_PER_VK_GROUP = 9
+        const val MAX_VK_HASHES = 4
+
+        /** Макс. потоков: 27 на каждый хеш (1→27, 2→54, 3→81, 4→108). */
+        fun maxAnonymousWorkers(hashCount: Int): Int {
+            val n = hashCount.coerceIn(1, MAX_VK_HASHES)
+            return n * WORKERS_PER_VK_GROUP * 3
+        }
 
         private val Context.dataStore by preferencesDataStore("settings")
         private val PEER = stringPreferencesKey("peer")
@@ -43,6 +57,12 @@ class SettingsStore(context: Context) {
         private val DEPLOY_LOGIN = stringPreferencesKey("deploy_login")
         private val DEPLOY_PASSWORD = stringPreferencesKey("deploy_password")
         private val DEPLOY_PASSWORD_ENCRYPTED = stringPreferencesKey("deploy_password_encrypted")
+        private val DEPLOY_SSH_USE_KEY = booleanPreferencesKey("deploy_ssh_use_key")
+        private val DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED = stringPreferencesKey("deploy_ssh_private_key_encrypted")
+        private val DEPLOY_SSH_PRIVATE_KEY = stringPreferencesKey("deploy_ssh_private_key") // legacy plaintext
+        private val DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED = stringPreferencesKey("deploy_ssh_key_passphrase_encrypted")
+        private val DEPLOY_SSH_KEY_PASSPHRASE = stringPreferencesKey("deploy_ssh_key_passphrase") // legacy
+        private val DEPLOY_SSH_KEY_NAME = stringPreferencesKey("deploy_ssh_key_name")
         private val DEPLOY_SSH_PORT = stringPreferencesKey("deploy_ssh_port")
         private val DEPLOY_DNS1 = stringPreferencesKey("deploy_dns1")
         private val DEPLOY_DNS2 = stringPreferencesKey("deploy_dns2")
@@ -72,9 +92,15 @@ class SettingsStore(context: Context) {
 
         private val VK_AUTH_MODE = stringPreferencesKey("vk_auth_mode") // "account" or "anonymous"
         private val VK_ANON_PATH = stringPreferencesKey("vk_anon_path") // "vkcalls" or "legacy"
+        private val GO_DNS_PRESET = stringPreferencesKey("go_dns_preset") // yandex/cloudflare/google/custom
+        private val GO_DNS_CUSTOM = stringPreferencesKey("go_dns_custom")
+        private val GO_DNS_DOH_CUSTOM = stringPreferencesKey("go_dns_doh_custom")
+        private val OBFS_MODE = stringPreferencesKey("obfs_mode") // "audio" or "video"
+        private val INTERFACE_ROLE = stringPreferencesKey("interface_role") // "user" or "admin"
         
         // ═══ VPN Exclusions Mode ═══
         private val IS_WHITELIST = booleanPreferencesKey("is_whitelist")
+        private val SPLIT_TUNNEL_WHITELIST_MIGRATED = booleanPreferencesKey("split_tunnel_whitelist_migrated")
 
         // ═══ Theme Mode ═══
         private val THEME_MODE = stringPreferencesKey("theme_mode") // "system", "light", "dark"
@@ -95,23 +121,184 @@ class SettingsStore(context: Context) {
         private val UPDATE_DIALOG_LAST_ACTION_VERSION = stringPreferencesKey("update_dialog_last_action_version")
         private val UPDATE_DIALOG_LAST_ACTION = stringPreferencesKey("update_dialog_last_action")
         private val UPDATE_DIALOG_LAST_ACTION_AT = longPreferencesKey("update_dialog_last_action_at")
+        private val INCLUDE_BETA_UPDATES = booleanPreferencesKey("include_beta_updates")
+        private val CHANGELOG_SHOWN_VERSION_CODE = intPreferencesKey("changelog_shown_version_code")
+        private val SUPPORT_NOTICE_SHOWN_VERSION_CODE = intPreferencesKey("support_notice_shown_version_code")
+
+        /** versionCode, при первом запуске которого показывается экран поддержки (донат + канал). */
+        const val SUPPORT_NOTICE_VERSION_CODE = 28
 
         // ═══ Поведение ═══
         private val AUTO_SWITCH_TO_LOGS = booleanPreferencesKey("auto_switch_to_logs")
+        private val STOP_ON_WIFI = booleanPreferencesKey("stop_on_wifi")
+        private val SORT_PROFILES_BY_PING = booleanPreferencesKey("sort_profiles_by_ping")
+        /** -1 = выкл, 0 = при каждом открытии, иначе интервал в часах (6/12/24). */
+        private val SUB_AUTO_REFRESH_HOURS = intPreferencesKey("sub_auto_refresh_hours")
+
+        const val SUB_AUTO_REFRESH_NEVER = -1
+        const val SUB_AUTO_REFRESH_EVERY_OPEN = 0
+        const val DEFAULT_SUB_AUTO_REFRESH_HOURS = 12
 
         private val HIDE_BLOCKER_WARNING = booleanPreferencesKey("hide_blocker_warning")
-        private val SHOW_SPEED_GRAPH = booleanPreferencesKey("show_speed_graph")
-        
+
         private val HAS_SEEN_WELCOME_DIALOG = booleanPreferencesKey("has_seen_welcome_dialog")
+        private val LAST_SEEN_VERSION_CODE = intPreferencesKey("last_seen_version_code")
+
+        /** versionCode, при первом запуске после которого включается VKCalls у всех. */
+        const val VKCALLS_FORCE_MIGRATION_VERSION = 23
+
+        private val migrationMutex = Mutex()
+        private val migrationReady = CompletableDeferred<Unit>()
+        @Volatile
+        private var migrationStarted = false
+
+        /** Нормализованный путь VK для Go-клиента. */
+        fun normalizeVkAnonPath(path: String?): String {
+            return if (path.equals("legacy", ignoreCase = true)) "legacy" else "vkcalls"
+        }
+
+        fun normalizeObfsMode(mode: String?): String {
+            return if (mode.equals("video", ignoreCase = true)) "video" else "audio"
+        }
+
+        fun obfsModeDisplay(mode: String): String {
+            return if (normalizeObfsMode(mode) == "video") "Видеозвонок (H.264)" else "Аудиозвонок (OPUS)"
+        }
+
+        /** DNS для Go-резолвера (login.vk.ru, api.vk.me). */
+        fun normalizeGoDnsPreset(preset: String?): String {
+            return when (preset?.trim()?.lowercase()) {
+                "cloudflare", "google", "custom",
+                "doh-yandex", "doh-cloudflare", "doh-google", "doh-custom" -> preset.trim().lowercase()
+                else -> "yandex" // включая устаревший "auto"
+            }
+        }
+
+        fun isDohGoDnsPreset(preset: String?): Boolean {
+            return normalizeGoDnsPreset(preset).startsWith("doh")
+        }
+
+        fun normalizeGoDnsServers(raw: String?): String {
+            if (raw.isNullOrBlank()) return ""
+            return raw.split(",", " ", "\n", ";")
+                .map { it.trim() }
+                .filter { it.matches(Regex("""\d{1,3}(?:\.\d{1,3}){3}""")) }
+                .distinct()
+                .joinToString(",")
+        }
+
+        fun normalizeGoDnsDohUrls(raw: String?): String {
+            if (raw.isNullOrBlank()) return ""
+            return raw.split(",", "\n", ";")
+                .mapNotNull { normalizeGoDnsDohUrlSingle(it) }
+                .distinct()
+                .joinToString(",")
+        }
+
+        private fun normalizeGoDnsDohUrlSingle(raw: String): String? {
+            val trimmed = raw.trim()
+            if (!trimmed.startsWith("https://", ignoreCase = true)) return null
+            return try {
+                val url = java.net.URL(trimmed)
+                if (url.host.isNullOrBlank()) return null
+                val path = url.path.trim('/')
+                if (path.isEmpty()) trimmed.trimEnd('/') + "/dns-query" else trimmed
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        data class GoDnsDisplay(
+            val preset: String,
+            val title: String,
+            val servers: List<String>,
+        )
+
+        fun goDnsDisplay(preset: String, customRaw: String = ""): GoDnsDisplay {
+            return when (normalizeGoDnsPreset(preset)) {
+                "cloudflare" -> GoDnsDisplay("cloudflare", "Cloudflare", listOf("1.1.1.1", "1.0.0.1"))
+                "google" -> GoDnsDisplay("google", "Google DNS", listOf("8.8.8.8", "8.8.4.4"))
+                "doh-yandex" -> GoDnsDisplay("doh-yandex", "Яндекс DoH", listOf("common.dot.dns.yandex.net"))
+                "doh-cloudflare" -> GoDnsDisplay("doh-cloudflare", "Cloudflare DoH", listOf("cloudflare-dns.com"))
+                "doh-google" -> GoDnsDisplay("doh-google", "Google DoH", listOf("dns.google"))
+                "doh-custom" -> {
+                    val urls = normalizeGoDnsDohUrls(customRaw)
+                        .split(",")
+                        .filter { it.isNotEmpty() }
+                    GoDnsDisplay("doh-custom", "Свой DoH", urls)
+                }
+                "custom" -> {
+                    val servers = normalizeGoDnsServers(customRaw)
+                        .split(",")
+                        .filter { it.isNotEmpty() }
+                    GoDnsDisplay("custom", "Свой DNS", servers)
+                }
+                else -> GoDnsDisplay("yandex", "Яндекс DNS", listOf("77.88.8.8", "77.88.8.1"))
+            }
+        }
+
+        fun goDnsDisplayFromArg(arg: String): GoDnsDisplay {
+            val trimmed = arg.trim()
+            return when {
+                trimmed.startsWith("custom:", ignoreCase = true) ->
+                    goDnsDisplay("custom", trimmed.removePrefix("custom:").removePrefix("CUSTOM:"))
+                trimmed.startsWith("doh:", ignoreCase = true) ->
+                    goDnsDisplay("doh-custom", trimmed.removePrefix("doh:").removePrefix("DOH:"))
+                else -> goDnsDisplay(trimmed)
+            }
+        }
+
+        fun formatGoDnsLogLine(info: GoDnsDisplay): String {
+            val servers = if (info.servers.isEmpty()) "не задан" else info.servers.joinToString(", ")
+            val proto = if (isDohGoDnsPreset(info.preset)) "DoH" else "UDP/TCP :53"
+            return "[КЛИЕНТ] DNS для VK: ${info.title} ($servers) — $proto"
+        }
+
+        suspend fun resolveGoDnsArg(context: Context): String {
+            awaitMigrations(context)
+            val store = SettingsStore(context)
+            return store.resolveGoDnsArg()
+        }
+
+        suspend fun awaitMigrations(context: Context) {
+            if (!migrationStarted) {
+                SettingsStore(context.applicationContext)
+            }
+            migrationReady.await()
+        }
+
+        suspend fun resolveVkAnonPath(context: Context): String {
+            awaitMigrations(context)
+            return normalizeVkAnonPath(SettingsStore(context).vkAnonPath.first())
+        }
+
+        private fun scheduleMigrations(store: SettingsStore) {
+            if (migrationStarted) return
+            synchronized(this) {
+                if (migrationStarted) return
+                migrationStarted = true
+                CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                    migrationMutex.withLock {
+                        try {
+                            store.migrateSecretsToKeystore()
+                            store.migrateLegacyWhitelistMode()
+                            store.runVersionMigrations()
+                        } finally {
+                            if (!migrationReady.isCompleted) {
+                                migrationReady.complete(Unit)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private val dataStore = appContext.dataStore
     private val secureStore = SecureStringStore(appContext)
 
     init {
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            migrateSecretsToKeystore()
-        }
+        scheduleMigrations(this)
     }
 
     val peer: Flow<String> = dataStore.data.map { it[PEER] ?: "" }
@@ -133,6 +320,14 @@ class SettingsStore(context: Context) {
     val deployPassword: Flow<String> = dataStore.data.map {
         readSecret(it, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD)
     }
+    val deploySshUseKey: Flow<Boolean> = dataStore.data.map { it[DEPLOY_SSH_USE_KEY] ?: false }
+    val deploySshPrivateKey: Flow<String> = dataStore.data.map {
+        readSecret(it, DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY)
+    }
+    val deploySshKeyPassphrase: Flow<String> = dataStore.data.map {
+        readSecret(it, DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED, DEPLOY_SSH_KEY_PASSPHRASE)
+    }
+    val deploySshKeyName: Flow<String> = dataStore.data.map { it[DEPLOY_SSH_KEY_NAME] ?: "" }
     val deploySshPort: Flow<String> = dataStore.data.map { it[DEPLOY_SSH_PORT] ?: "" }
     val deployDns1: Flow<String> = dataStore.data.map { it[DEPLOY_DNS1] ?: "1.1.1.1" }
     val deployDns2: Flow<String> = dataStore.data.map { it[DEPLOY_DNS2] ?: "1.0.0.1" }
@@ -165,6 +360,14 @@ class SettingsStore(context: Context) {
     val captchaSolveMethod: Flow<String> = dataStore.data.map { it[CAPTCHA_SOLVE_METHOD] ?: "auto" }
     val vkAuthMode: Flow<String> = dataStore.data.map { it[VK_AUTH_MODE] ?: "anonymous" }
     val vkAnonPath: Flow<String> = dataStore.data.map { it[VK_ANON_PATH] ?: "vkcalls" }
+    val goDnsPreset: Flow<String> = dataStore.data.map { normalizeGoDnsPreset(it[GO_DNS_PRESET]) }
+    val goDnsCustom: Flow<String> = dataStore.data.map { it[GO_DNS_CUSTOM] ?: "" }
+    val goDnsDohCustom: Flow<String> = dataStore.data.map { it[GO_DNS_DOH_CUSTOM] ?: "" }
+    val obfsMode: Flow<String> = dataStore.data.map { normalizeObfsMode(it[OBFS_MODE]) }
+    /** "admin" показывает вкладку Деплой; "user" скрывает. По умолчанию admin. */
+    val interfaceRole: Flow<String> = dataStore.data.map {
+        if ((it[INTERFACE_ROLE] ?: "admin").equals("user", ignoreCase = true)) "user" else "admin"
+    }
     val captchaWbvSolveMethod: Flow<String> = dataStore.data.map { it[CAPTCHA_WBV_SOLVE_METHOD] ?: "auto" }
 
     // ═══ VPN Exclusions Mode ═══
@@ -200,25 +403,43 @@ class SettingsStore(context: Context) {
     val updateDialogLastActionVersion: Flow<String> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION_VERSION] ?: "" }
     val updateDialogLastAction: Flow<String> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION] ?: "" }
     val updateDialogLastActionAt: Flow<Long> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
+    val includeBetaUpdates: Flow<Boolean> = dataStore.data.map { it[INCLUDE_BETA_UPDATES] ?: false }
+    val changelogShownVersionCode: Flow<Int> = dataStore.data.map { it[CHANGELOG_SHOWN_VERSION_CODE] ?: 0 }
+    val supportNoticeShownVersionCode: Flow<Int> = dataStore.data.map { it[SUPPORT_NOTICE_SHOWN_VERSION_CODE] ?: 0 }
 
     // ═══ Поведение ═══
     val autoSwitchToLogs: Flow<Boolean> = dataStore.data.map { it[AUTO_SWITCH_TO_LOGS] ?: true }
+    val stopOnWifi: Flow<Boolean> = dataStore.data.map { it[STOP_ON_WIFI] ?: false }
+    val sortProfilesByPing: Flow<Boolean> = dataStore.data.map { it[SORT_PROFILES_BY_PING] ?: false }
+    val subscriptionAutoRefreshHours: Flow<Int> = dataStore.data.map {
+        it[SUB_AUTO_REFRESH_HOURS] ?: DEFAULT_SUB_AUTO_REFRESH_HOURS
+    }
 
     val hideBlockerWarning: Flow<Boolean> = dataStore.data.map { it[HIDE_BLOCKER_WARNING] ?: false }
-    val showSpeedGraph: Flow<Boolean> = dataStore.data.map { it[SHOW_SPEED_GRAPH] ?: true }
 
     suspend fun saveAutoSwitchToLogs(enabled: Boolean) {
         dataStore.edit { prefs -> prefs[AUTO_SWITCH_TO_LOGS] = enabled }
     }
 
+    suspend fun saveStopOnWifi(enabled: Boolean) {
+        dataStore.edit { prefs -> prefs[STOP_ON_WIFI] = enabled }
+    }
 
+    suspend fun saveSubscriptionAutoRefreshHours(hours: Int) {
+        val normalized = when (hours) {
+            SUB_AUTO_REFRESH_NEVER, SUB_AUTO_REFRESH_EVERY_OPEN -> hours
+            6, 12, 24 -> hours
+            else -> DEFAULT_SUB_AUTO_REFRESH_HOURS
+        }
+        dataStore.edit { prefs -> prefs[SUB_AUTO_REFRESH_HOURS] = normalized }
+    }
+
+    suspend fun saveSortProfilesByPing(enabled: Boolean) {
+        dataStore.edit { prefs -> prefs[SORT_PROFILES_BY_PING] = enabled }
+    }
 
     suspend fun saveHideBlockerWarning(hide: Boolean) {
         dataStore.edit { prefs -> prefs[HIDE_BLOCKER_WARNING] = hide }
-    }
-
-    suspend fun saveShowSpeedGraph(show: Boolean) {
-        dataStore.edit { prefs -> prefs[SHOW_SPEED_GRAPH] = show }
     }
 
     suspend fun saveThemeMode(mode: String) {
@@ -257,6 +478,24 @@ class SettingsStore(context: Context) {
     suspend fun saveUpdateCheckIntervalHours(hours: Int) {
         dataStore.edit { prefs ->
             prefs[UPDATE_CHECK_INTERVAL_HOURS] = hours
+        }
+    }
+
+    suspend fun saveIncludeBetaUpdates(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[INCLUDE_BETA_UPDATES] = enabled
+        }
+    }
+
+    suspend fun saveChangelogShownVersionCode(versionCode: Int) {
+        dataStore.edit { prefs ->
+            prefs[CHANGELOG_SHOWN_VERSION_CODE] = versionCode
+        }
+    }
+
+    suspend fun saveSupportNoticeShownVersionCode(versionCode: Int) {
+        dataStore.edit { prefs ->
+            prefs[SUPPORT_NOTICE_SHOWN_VERSION_CODE] = versionCode
         }
     }
 
@@ -340,7 +579,16 @@ class SettingsStore(context: Context) {
         appContext.dataStore.edit { it[GLOBAL_VK_HASHES] = hashes }
     }
 
-    suspend fun saveDeploy(ip: String, login: String, pass: String, sshPort: String, dns1: String, dns2: String) {
+    suspend fun saveDeploy(
+        ip: String,
+        login: String,
+        pass: String,
+        sshPort: String,
+        dns1: String,
+        dns2: String,
+        useSshKey: Boolean? = null,
+        keyPassphrase: String? = null,
+    ) {
         dataStore.edit { prefs ->
             prefs[DEPLOY_IP] = ip
             prefs[DEPLOY_LOGIN] = login
@@ -348,12 +596,33 @@ class SettingsStore(context: Context) {
             prefs[DEPLOY_SSH_PORT] = sshPort
             prefs[DEPLOY_DNS1] = dns1
             prefs[DEPLOY_DNS2] = dns2
+            useSshKey?.let { prefs[DEPLOY_SSH_USE_KEY] = it }
+            keyPassphrase?.let {
+                prefs.putSecret(DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED, DEPLOY_SSH_KEY_PASSPHRASE, it)
+            }
+        }
+    }
+
+    suspend fun saveDeploySshPrivateKey(keyContent: String, keyName: String) {
+        dataStore.edit { prefs ->
+            prefs.putSecret(DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, keyContent)
+            prefs[DEPLOY_SSH_KEY_NAME] = keyName
+            prefs[DEPLOY_SSH_USE_KEY] = true
+        }
+    }
+
+    suspend fun clearDeploySshPrivateKey() {
+        dataStore.edit { prefs ->
+            prefs.remove(DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED)
+            prefs.remove(DEPLOY_SSH_PRIVATE_KEY)
+            prefs.remove(DEPLOY_SSH_KEY_NAME)
         }
     }
 
     suspend fun saveExcludedApps(packages: String) {
         dataStore.edit { prefs ->
             prefs[EXCLUDED_APPS] = packages
+            prefs[SPLIT_TUNNEL_WHITELIST_MIGRATED] = true
         }
     }
     
@@ -416,6 +685,51 @@ class SettingsStore(context: Context) {
         }
     }
 
+    suspend fun saveGoDnsPreset(preset: String) {
+        saveGoDns(preset, null)
+    }
+
+    suspend fun saveGoDns(preset: String, custom: String? = null, dohCustom: String? = null) {
+        dataStore.edit { prefs ->
+            val normalizedPreset = normalizeGoDnsPreset(preset)
+            prefs[GO_DNS_PRESET] = normalizedPreset
+            if (custom != null) {
+                prefs[GO_DNS_CUSTOM] = normalizeGoDnsServers(custom)
+            }
+            if (dohCustom != null) {
+                prefs[GO_DNS_DOH_CUSTOM] = normalizeGoDnsDohUrls(dohCustom)
+            }
+        }
+    }
+
+    suspend fun saveObfsMode(mode: String) {
+        dataStore.edit { prefs ->
+            prefs[OBFS_MODE] = normalizeObfsMode(mode)
+        }
+    }
+
+    suspend fun saveInterfaceRole(role: String) {
+        val normalized = if (role.equals("user", ignoreCase = true)) "user" else "admin"
+        dataStore.edit { prefs ->
+            prefs[INTERFACE_ROLE] = normalized
+        }
+    }
+
+    suspend fun resolveGoDnsArg(): String {
+        val preset = normalizeGoDnsPreset(goDnsPreset.first())
+        return when (preset) {
+            "custom" -> {
+                val servers = normalizeGoDnsServers(goDnsCustom.first())
+                if (servers.isNotEmpty()) "custom:$servers" else "yandex"
+            }
+            "doh-custom" -> {
+                val urls = normalizeGoDnsDohUrls(goDnsDohCustom.first())
+                if (urls.isNotEmpty()) "doh:$urls" else "doh-yandex"
+            }
+            else -> preset
+        }
+    }
+
     suspend fun saveWbvCaptchaSolveMethod(method: String) {
         dataStore.edit { prefs ->
             prefs[CAPTCHA_WBV_SOLVE_METHOD] = method
@@ -429,6 +743,7 @@ class SettingsStore(context: Context) {
     suspend fun saveIsWhitelist(enabled: Boolean) {
         dataStore.edit { prefs ->
             prefs[IS_WHITELIST] = enabled
+            prefs[SPLIT_TUNNEL_WHITELIST_MIGRATED] = true
         }
     }
 
@@ -437,7 +752,44 @@ class SettingsStore(context: Context) {
         dataStore.edit { prefs ->
             prefs[EXCLUDED_APPS] = packages
             prefs[IS_WHITELIST] = isWhitelist
+            prefs[SPLIT_TUNNEL_WHITELIST_MIGRATED] = true
         }
+    }
+
+    suspend fun migrateLegacyWhitelistMode() {
+        val currentPrefs = dataStore.data.first()
+        if (currentPrefs[SPLIT_TUNNEL_WHITELIST_MIGRATED] == true) return
+
+        val hasLegacyWhitelist = currentPrefs[IS_WHITELIST] == true
+        val installedApps = if (hasLegacyWhitelist) installedSplitTunnelPackages() else emptySet()
+        dataStore.edit { prefs ->
+            if (prefs[SPLIT_TUNNEL_WHITELIST_MIGRATED] == true) return@edit
+
+            if (prefs[IS_WHITELIST] == true) {
+                val legacyExcluded = prefs[EXCLUDED_APPS]
+                    ?.split(",")
+                    ?.filter { it.isNotEmpty() }
+                    ?.toSet()
+                    ?: emptySet()
+                prefs[EXCLUDED_APPS] = (installedApps - legacyExcluded).sorted().joinToString(",")
+            }
+
+            prefs[SPLIT_TUNNEL_WHITELIST_MIGRATED] = true
+        }
+    }
+
+    private fun installedSplitTunnelPackages(): Set<String> {
+        return runCatching {
+            appContext.packageManager
+                .getInstalledApplications(PackageManager.GET_META_DATA)
+                .map { it.packageName }
+                .filter {
+                    it != appContext.packageName &&
+                        !it.contains("vkontakte") &&
+                        !it.contains("vk.calls")
+                }
+                .toSet()
+        }.getOrDefault(emptySet())
     }
 
     private suspend fun migrateSecretsToKeystore() {
@@ -450,12 +802,36 @@ class SettingsStore(context: Context) {
         }
     }
 
+    private suspend fun runVersionMigrations() {
+        val currentCode = BuildConfig.VERSION_CODE
+        dataStore.edit { prefs ->
+            val lastSeen = prefs[LAST_SEEN_VERSION_CODE] ?: 0
+            if (currentCode <= lastSeen) {
+                return@edit
+            }
+            if (lastSeen < VKCALLS_FORCE_MIGRATION_VERSION && currentCode >= VKCALLS_FORCE_MIGRATION_VERSION) {
+                prefs[VK_ANON_PATH] = "vkcalls"
+            }
+            prefs[LAST_SEEN_VERSION_CODE] = currentCode
+        }
+    }
+
     private fun readSecret(
         prefs: Preferences,
         encryptedKey: Preferences.Key<String>,
         legacyKey: Preferences.Key<String>
     ): String {
-        return secureStore.decrypt(prefs[encryptedKey]) ?: prefs[legacyKey] ?: ""
+        val encrypted = prefs[encryptedKey]
+        val fromSecure = secureStore.decrypt(encrypted)
+        if (!fromSecure.isNullOrEmpty()) return fromSecure
+        // Если encrypted-ключ ещё хранит legacy plaintext (без v1:)
+        if (!encrypted.isNullOrBlank() && !encrypted.startsWith("v1:")) {
+            return encrypted
+        }
+        if (legacyKey != encryptedKey) {
+            return prefs[legacyKey] ?: ""
+        }
+        return ""
     }
 
     private fun MutablePreferences.putSecret(
@@ -465,10 +841,13 @@ class SettingsStore(context: Context) {
     ) {
         if (value.isBlank()) {
             remove(encryptedKey)
-            remove(legacyKey)
+            if (legacyKey != encryptedKey) remove(legacyKey)
         } else {
             this[encryptedKey] = secureStore.encrypt(value)
-            remove(legacyKey)
+            // Важно: для SSH-ключа encryptedKey == legacyKey — нельзя remove после записи.
+            if (legacyKey != encryptedKey) {
+                remove(legacyKey)
+            }
         }
     }
 

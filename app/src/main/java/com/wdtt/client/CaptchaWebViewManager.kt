@@ -213,7 +213,7 @@ object CaptchaWebViewManager {
         val vw = VIEWPORT_WIDTHS[Random.Default.nextInt(VIEWPORT_WIDTHS.size)]
         val vh = VIEWPORT_HEIGHTS[Random.Default.nextInt(VIEWPORT_HEIGHTS.size)]
         val chromeBuild = CHROME_BUILDS[Random.Default.nextInt(CHROME_BUILDS.size)]
-        val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chromeBuild Safari/537.36"
+        val ua = VkCaptchaWebViewUa.randomDesktop()
 
         Log.d(TAG, "Fingerprint: ${vw}x${vh}, Chrome/$chromeBuild")
 

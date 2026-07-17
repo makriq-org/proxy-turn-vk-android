@@ -183,7 +183,7 @@ func RunSession(
 	var obfsCfg *ObfsConfig
 	var obfsWriteState *ObfsState
 	if useWrap {
-		obfsCfg = NewObfsConfig()
+		obfsCfg = NewObfsConfig(tp.ObfsMode)
 		obfsWriteState = NewObfsState()
 	}
 
@@ -305,8 +305,8 @@ func RunSession(
 	}
 	log.Printf("[ВОРКЕР #%d] [DTLS] Соединение установлено ✓", sessionID)
 
-	atomic.AddInt32(&stats.ActiveConnections, 1)
-	defer atomic.AddInt32(&stats.ActiveConnections, -1)
+	stats.ActiveConnections.Add(1)
+	defer stats.ActiveConnections.Add(-1)
 
 	// Запрос конфига
 	if getConfig && configCh != nil {
@@ -516,7 +516,7 @@ func RunPing(
 	var obfsCfg *ObfsConfig
 	var obfsWriteState *ObfsState
 	if useWrap {
-		obfsCfg = NewObfsConfig()
+		obfsCfg = NewObfsConfig(tp.ObfsMode)
 		obfsWriteState = NewObfsState()
 	}
 

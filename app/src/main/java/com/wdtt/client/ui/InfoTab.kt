@@ -80,6 +80,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.wdtt.client.AppLinks
 import com.wdtt.client.BuildConfig
 import com.wdtt.client.R
 import com.wdtt.client.SettingsStore
@@ -98,8 +99,8 @@ private const val ReleasesUrl = "https://github.com/makriq-org/proxy-turn-vk-and
 private const val IssuesUrl = "https://github.com/SpaceNeuroX/proxy-turn-vk-android/issues/new"
 private const val DeveloperProfileUrl = "https://github.com/SpaceNeuroX"
 private const val RepositoryUrl = "https://github.com/SpaceNeuroX/proxy-turn-vk-android"
-private const val TelegramChannelUrl = "https://t.me/darkbitVPN"
-private const val DonateUrl = ""
+private const val TelegramChannelUrl = AppLinks.TELEGRAM_CHANNEL
+private const val DonateUrl = AppLinks.DONATE_URL
 
 private val browserPackages = listOf(
     "com.android.chrome",
@@ -168,10 +169,11 @@ fun InfoTab() {
     var projectExpanded by rememberSaveable { mutableStateOf(true) }
     val updateLatestVersion by settingsStore.updateLatestVersion.collectAsStateWithLifecycle(initialValue = "")
     val updateLastError by settingsStore.updateLastError.collectAsStateWithLifecycle(initialValue = "")
-    val updateStatus = remember(isCheckingUpdates, updateLatestVersion, updateLastError, currentVersion) {
+    val includeBetaUpdates by settingsStore.includeBetaUpdates.collectAsStateWithLifecycle(initialValue = false)
+    val updateStatus = remember(isCheckingUpdates, updateLatestVersion, updateLastError, currentVersion, includeBetaUpdates) {
         when {
             isCheckingUpdates -> "Проверяем GitHub releases..."
-            updateLatestVersion.isNotBlank() && isNewerVersion(currentVersion, updateLatestVersion) ->
+            updateLatestVersion.isNotBlank() && isNewerVersion(currentVersion, updateLatestVersion, includeBetaUpdates) ->
                 "На GitHub доступна версия $updateLatestVersion"
             updateLatestVersion.isNotBlank() -> "Последняя версия: $updateLatestVersion"
             updateLastError.isNotBlank() -> "Последняя проверка завершилась ошибкой"
@@ -277,7 +279,7 @@ fun InfoTab() {
                     isCheckingUpdates = true
                     scope.launch {
                         val checkedAt = System.currentTimeMillis()
-                        val release = fetchLatestReleaseInfo(currentVersion)
+                        val release = fetchLatestReleaseInfo(currentVersion, includeBetaUpdates)
                         val latest = release?.versionTag
                         settingsStore.saveUpdateState(
                             lastCheckAt = checkedAt,
@@ -296,7 +298,7 @@ fun InfoTab() {
                             return@launch
                         }
 
-                        if (isNewerVersion(currentVersion, release.versionTag)) {
+                        if (isNewerVersion(currentVersion, release.versionTag, includeBetaUpdates)) {
                             settingsStore.saveUpdateDialogShown(release.versionTag, checkedAt)
                             pendingManualRelease = release
                         } else {

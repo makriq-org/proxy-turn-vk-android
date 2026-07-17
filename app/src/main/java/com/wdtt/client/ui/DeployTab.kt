@@ -20,13 +20,17 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import com.wdtt.client.TunnelService
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import android.widget.Toast
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.ChannelSftp
@@ -58,12 +62,18 @@ fun DeployTab() {
     val savedIp by settingsStore.deployIp.collectAsStateWithLifecycle(initialValue = "")
     val savedLogin by settingsStore.deployLogin.collectAsStateWithLifecycle(initialValue = "")
     val savedPassword by settingsStore.deployPassword.collectAsStateWithLifecycle(initialValue = "")
+    val savedSshUseKey by settingsStore.deploySshUseKey.collectAsStateWithLifecycle(initialValue = false)
+    val savedSshPrivateKey by settingsStore.deploySshPrivateKey.collectAsStateWithLifecycle(initialValue = "")
+    val savedSshKeyPassphrase by settingsStore.deploySshKeyPassphrase.collectAsStateWithLifecycle(initialValue = "")
+    val savedSshKeyName by settingsStore.deploySshKeyName.collectAsStateWithLifecycle(initialValue = "")
     val savedDns1 by settingsStore.deployDns1.collectAsStateWithLifecycle(initialValue = "1.1.1.1")
     val savedDns2 by settingsStore.deployDns2.collectAsStateWithLifecycle(initialValue = "1.0.0.1")
 
     var ip by remember { mutableStateOf("") }
     var login by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var sshUseKey by rememberSaveable { mutableStateOf(false) }
+    var sshKeyPassphrase by remember { mutableStateOf("") }
     var dns1 by remember { mutableStateOf("1.1.1.1") }
     var dns2 by remember { mutableStateOf("1.0.0.1") }
 
@@ -98,6 +108,8 @@ fun DeployTab() {
     LaunchedEffect(savedIp) { if (savedIp.isNotEmpty()) ip = savedIp }
     LaunchedEffect(savedLogin) { if (savedLogin.isNotEmpty()) login = savedLogin }
     LaunchedEffect(savedPassword) { if (savedPassword.isNotEmpty()) password = savedPassword }
+    LaunchedEffect(savedSshUseKey) { sshUseKey = savedSshUseKey }
+    LaunchedEffect(savedSshKeyPassphrase) { if (savedSshKeyPassphrase.isNotEmpty()) sshKeyPassphrase = savedSshKeyPassphrase }
     LaunchedEffect(savedDns1) { if (savedDns1.isNotEmpty()) dns1 = savedDns1 }
     LaunchedEffect(savedDns2) { if (savedDns2.isNotEmpty()) dns2 = savedDns2 }
     val animatedProgress by animateFloatAsState(
@@ -106,8 +118,75 @@ fun DeployTab() {
         label = "progress"
     )
 
+    fun persistDeployFields() {
+        scope.launch {
+            settingsStore.saveDeploy(
+                ip = ip,
+                login = login,
+                pass = password,
+                sshPort = savedSshPort,
+                dns1 = dns1,
+                dns2 = dns2,
+                useSshKey = sshUseKey,
+                keyPassphrase = sshKeyPassphrase,
+            )
+        }
+    }
+
+    val sshKeyPickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri == null || isDeploying) return@rememberLauncherForActivityResult
+        scope.launch {
+            val content = withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openInputStream(uri)?.use { it.bufferedReader().readText() }
+                }.getOrNull()
+            }
+            if (content.isNullOrBlank()) {
+                Toast.makeText(context, "Не удалось прочитать файл ключа", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            val normalized = content.trim()
+            val looksLikePrivateKey =
+                normalized.contains("BEGIN OPENSSH PRIVATE KEY") ||
+                    normalized.contains("BEGIN RSA PRIVATE KEY") ||
+                    normalized.contains("BEGIN EC PRIVATE KEY") ||
+                    normalized.contains("BEGIN PRIVATE KEY") ||
+                    (normalized.contains("PRIVATE KEY") && normalized.contains("BEGIN"))
+            if (!looksLikePrivateKey) {
+                Toast.makeText(context, "Нужен приватный ключ (не .pub). OpenSSH или PEM.", Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            val rawName = uri.lastPathSegment?.substringAfterLast('/') ?: "ssh-key"
+            val keyName = rawName
+                .substringAfterLast(':')
+                .substringAfterLast('%')
+                .replace("%2F", "/", ignoreCase = true)
+                .substringAfterLast('/')
+                .ifBlank { "ssh-key" }
+            runCatching {
+                settingsStore.saveDeploySshPrivateKey(normalized, keyName)
+            }.onFailure {
+                Toast.makeText(context, "Не удалось сохранить ключ: ${it.message}", Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            sshUseKey = true
+            Toast.makeText(context, "SSH-ключ сохранён: $keyName", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val hasSshCredentials = if (sshUseKey) {
+        savedSshPrivateKey.isNotBlank()
+    } else {
+        password.isNotBlank()
+    }
+
+    val scrollState = rememberScrollState()
+
     Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp, vertical = 16.dp)
+            .padding(bottom = 8.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text(
@@ -116,127 +195,6 @@ fun DeployTab() {
             color = MaterialTheme.colorScheme.onSurface
         )
 
-        // ═══ Поля ввода в Card ═══
-        AppSectionCard(
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            OutlinedTextField(
-                value = ip,
-                onValueChange = {
-                    ip = it.filter { c -> !c.isWhitespace() }
-                    scope.launch { settingsStore.saveDeploy(ip, login, password, savedSshPort, dns1, dns2) }
-                },
-                label = { Text("IP сервера или домен (без порта)") },
-                placeholder = { Text("1.2.3.4 (без порта)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                enabled = !isDeploying,
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                OutlinedTextField(
-                    value = login,
-                    onValueChange = {
-                        login = it.filter { c -> !c.isWhitespace() }
-                        scope.launch { settingsStore.saveDeploy(ip, login, password, savedSshPort, dns1, dns2) }
-                    },
-                    label = { Text("Логин") },
-                    placeholder = { Text("root") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(16.dp),
-                    enabled = !isDeploying,
-                )
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = {
-                        password = it.filter { c -> !c.isWhitespace() }
-                        scope.launch { settingsStore.saveDeploy(ip, login, password, savedSshPort, dns1, dns2) }
-                    },
-                    label = { Text("Пароль SSH") },
-                    placeholder = { Text("password") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(16.dp),
-                    enabled = !isDeploying,
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                OutlinedTextField(
-                    value = dns1,
-                    onValueChange = {
-                        dns1 = it.filter { c -> !c.isWhitespace() }
-                        scope.launch { settingsStore.saveDeploy(ip, login, password, savedSshPort, dns1, dns2) }
-                    },
-                    label = { Text("Основной DNS") },
-                    placeholder = { Text("1.1.1.1") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(16.dp),
-                    enabled = !isDeploying,
-                )
-                OutlinedTextField(
-                    value = dns2,
-                    onValueChange = {
-                        dns2 = it.filter { c -> !c.isWhitespace() }
-                        scope.launch { settingsStore.saveDeploy(ip, login, password, savedSshPort, dns1, dns2) }
-                    },
-                    label = { Text("Резервный DNS") },
-                    placeholder = { Text("1.0.0.1") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(16.dp),
-                    enabled = !isDeploying,
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    "Ручное управление портами",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium,
-                    modifier = Modifier.weight(1f),
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                Switch(
-                    checked = savedManualPorts,
-                    enabled = !isDeploying,
-                    onCheckedChange = { enabled ->
-                        scope.launch { settingsStore.saveManualPortsEnabled(enabled) }
-                    }
-                )
-            }
-        }
-
-        if (showSecretsDialog) {
-            DeploySecretsDialog(
-                settingsStore = settingsStore,
-                initialMainPass = savedMainPass,
-                initialAdminId = savedAdminId,
-                initialBotToken = savedBotToken,
-                initialSshPort = savedSshPort,
-                manualPortsEnabled = savedManualPorts,
-                initialServerDtlsPort = savedServerDtlsPort.toString(),
-                initialServerWgPort = savedServerWgPort.toString(),
-                onSaved = { _, _ -> },
-                onDismiss = { showSecretsDialog = false }
-            )
-        }
-
-        // ═══ Прогресс ═══
         if (isDeploying) {
             AppSectionCard(
                 contentPadding = PaddingValues(16.dp),
@@ -271,7 +229,30 @@ fun DeployTab() {
             }
         }
 
-        // ═══ Кнопки ═══
+        if (showSuccessBanner) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = WDTTColors.connected.copy(alpha = 0.12f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                border = BorderStroke(1.dp, WDTTColors.connected.copy(alpha = 0.4f))
+            ) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = WDTTColors.connected)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Деплой успешно завершен ($successCountdown)",
+                        color = WDTTColors.connected,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            }
+        }
+
         val deploySecretsMissing = savedMainPass.isBlank()
         OutlinedButton(
             onClick = { showSecretsDialog = true },
@@ -287,9 +268,14 @@ fun DeployTab() {
             )
         ) {
             Icon(Icons.Default.Key, null, Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(8.dp))
             Text(
-                if (savedManualPorts) "Секреты (BOT, Пароли, Порты)" else "Секреты (BOT, Пароли)",
+                when {
+                    deploySecretsMissing && savedManualPorts -> "Секреты — укажите пароль WDTT, порты"
+                    deploySecretsMissing -> "Секреты — нужен пароль WDTT"
+                    savedManualPorts -> "Секреты (BOT, Пароли, Порты)"
+                    else -> "Секреты (BOT, Пароли)"
+                },
                 fontWeight = FontWeight.SemiBold
             )
         }
@@ -300,11 +286,17 @@ fun DeployTab() {
         ) {
             Button(
                 onClick = {
-                    if (ip.isBlank() || password.isBlank() || savedMainPass.isBlank()) return@Button
+                    if (ip.isBlank() || !hasSshCredentials || savedMainPass.isBlank()) return@Button
                     val effectiveLogin = if (login.isBlank()) "root" else login
                     val effectiveDtlsPort = if (savedManualPorts) savedServerDtlsPort.coerceIn(1, 65535) else 56000
                     val effectiveWgPort = if (savedManualPorts) savedServerWgPort.coerceIn(1, 65535) else 56001
                     val appContext = context.applicationContext
+                    val sshAuth = buildSshAuth(
+                        useKey = sshUseKey,
+                        password = password,
+                        privateKey = savedSshPrivateKey,
+                        keyPassphrase = sshKeyPassphrase,
+                    )
                     DeployManager.scope.launch {
                         try {
                             DeployManager.startDeploy()
@@ -314,9 +306,17 @@ fun DeployTab() {
 
                             val success = performDeploy(
                                 context = appContext,
-                                host = ip, user = effectiveLogin, pass = password, port = savedSshPort.toIntOrNull() ?: 22,
-                                mainPass = savedMainPass, adminId = savedAdminId, botToken = savedBotToken,
-                                dtlsPort = effectiveDtlsPort, wgPort = effectiveWgPort, dns1 = dns1, dns2 = dns2,
+                                host = ip,
+                                user = effectiveLogin,
+                                port = savedSshPort.toIntOrNull() ?: 22,
+                                sshAuth = sshAuth,
+                                mainPass = savedMainPass,
+                                adminId = savedAdminId,
+                                botToken = savedBotToken,
+                                dtlsPort = effectiveDtlsPort,
+                                wgPort = effectiveWgPort,
+                                dns1 = dns1,
+                                dns2 = dns2,
                                 onProgress = { p, s -> DeployManager.updateProgress(p, s) }
                             )
                             if (success) {
@@ -331,20 +331,20 @@ fun DeployTab() {
                 modifier = Modifier.weight(1f).height(50.dp),
                 shape = RoundedCornerShape(16.dp),
                 colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary),
-                enabled = !isDeploying && ip.isNotBlank() && password.isNotBlank() && savedMainPass.isNotBlank()
+                enabled = !isDeploying && ip.isNotBlank() && hasSshCredentials && savedMainPass.isNotBlank()
             ) {
                 if (isDeploying) {
                     CircularProgressIndicator(modifier = Modifier.size(18.dp), color = MaterialTheme.colorScheme.onPrimary, strokeWidth = 2.dp)
                 } else {
                     Icon(Icons.Default.CloudUpload, null, Modifier.size(18.dp))
                 }
-                Spacer(Modifier.width(8.dp))
+                Spacer(modifier = Modifier.width(8.dp))
                 Text(if (isDeploying) "Установка..." else "Установить", fontWeight = FontWeight.Bold)
             }
 
             Button(
                 onClick = {
-                    if (ip.isBlank() || password.isBlank()) return@Button
+                    if (ip.isBlank() || !hasSshCredentials) return@Button
                     showUninstallDialog = true
                 },
                 modifier = Modifier.weight(1f).height(50.dp),
@@ -353,12 +353,312 @@ fun DeployTab() {
                     containerColor = MaterialTheme.colorScheme.error,
                     contentColor = MaterialTheme.colorScheme.onError
                 ),
-                enabled = !isDeploying && ip.isNotBlank() && password.isNotBlank()
+                enabled = !isDeploying && ip.isNotBlank() && hasSshCredentials
             ) {
                 Icon(Icons.Default.Delete, null, Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
+                Spacer(modifier = Modifier.width(8.dp))
                 Text("Удалить", fontWeight = FontWeight.Bold)
             }
+        }
+
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .verticalScroll(scrollState),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+        // ═══ Поля ввода в Card ═══
+        AppSectionCard(
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedTextField(
+                    value = ip,
+                    onValueChange = {
+                        ip = it.filter { c -> !c.isWhitespace() }
+                        persistDeployFields()
+                    },
+                    label = { Text("IP / домен") },
+                    placeholder = { Text("1.2.3.4") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(16.dp),
+                    enabled = !isDeploying,
+                )
+                OutlinedTextField(
+                    value = login,
+                    onValueChange = {
+                        login = it.filter { c -> !c.isWhitespace() }
+                        persistDeployFields()
+                    },
+                    label = { Text("Логин") },
+                    placeholder = { Text("root") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(16.dp),
+                    enabled = !isDeploying,
+                )
+            }
+
+            Text(
+                "Вход на сервер",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.primary,
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = {
+                        if (sshUseKey && !isDeploying) {
+                            sshUseKey = false
+                            persistDeployFields()
+                        }
+                    },
+                    modifier = Modifier.weight(1f).height(44.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    enabled = !isDeploying,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = if (!sshUseKey) {
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+                        } else {
+                            MaterialTheme.colorScheme.surface
+                        },
+                        contentColor = if (!sshUseKey) {
+                            MaterialTheme.colorScheme.onPrimaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        }
+                    ),
+                    border = BorderStroke(
+                        1.dp,
+                        if (!sshUseKey) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)
+                    )
+                ) {
+                    Text("Пароль", fontWeight = if (!sshUseKey) FontWeight.Bold else FontWeight.Medium)
+                }
+                OutlinedButton(
+                    onClick = {
+                        if (!sshUseKey && !isDeploying) {
+                            sshUseKey = true
+                            persistDeployFields()
+                        }
+                    },
+                    modifier = Modifier.weight(1f).height(44.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    enabled = !isDeploying,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = if (sshUseKey) {
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+                        } else {
+                            MaterialTheme.colorScheme.surface
+                        },
+                        contentColor = if (sshUseKey) {
+                            MaterialTheme.colorScheme.onPrimaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        }
+                    ),
+                    border = BorderStroke(
+                        1.dp,
+                        if (sshUseKey) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)
+                    )
+                ) {
+                    Text("SSH-ключ", fontWeight = if (sshUseKey) FontWeight.Bold else FontWeight.Medium)
+                }
+            }
+
+            if (sshUseKey) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = { sshKeyPickerLauncher.launch("*/*") },
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        enabled = !isDeploying,
+                    ) {
+                        Icon(Icons.Default.Key, null, Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            if (savedSshPrivateKey.isNotBlank()) "Сменить ключ" else "Выбрать ключ",
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    if (savedSshPrivateKey.isNotBlank()) {
+                        IconButton(
+                            onClick = {
+                                scope.launch {
+                                    settingsStore.clearDeploySshPrivateKey()
+                                    Toast.makeText(context, "SSH-ключ удалён", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            enabled = !isDeploying,
+                        ) {
+                            Icon(Icons.Default.Delete, contentDescription = "Удалить ключ")
+                        }
+                    }
+                }
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = if (savedSshPrivateKey.isNotBlank() || savedSshKeyName.isNotBlank()) {
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                    } else {
+                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = if (savedSshPrivateKey.isNotBlank()) {
+                                Icons.Default.CheckCircle
+                            } else {
+                                Icons.Default.Key
+                            },
+                            contentDescription = null,
+                            tint = if (savedSshPrivateKey.isNotBlank()) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = when {
+                                savedSshPrivateKey.isNotBlank() ->
+                                    "Ключ загружен: ${savedSshKeyName.ifBlank { "private key" }}"
+                                savedSshKeyName.isNotBlank() ->
+                                    "Ключ «$savedSshKeyName» сохранён с ошибкой — выберите файл снова"
+                                else ->
+                                    "Ключ ещё не выбран (нужен приватный файл, не .pub)"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium,
+                            color = if (savedSshPrivateKey.isNotBlank()) {
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    }
+                }
+                OutlinedTextField(
+                    value = sshKeyPassphrase,
+                    onValueChange = {
+                        sshKeyPassphrase = it
+                        persistDeployFields()
+                    },
+                    label = { Text("Пароль от ключа") },
+                    placeholder = { Text("если ключ защищён паролем") },
+                    supportingText = {
+                        Text("Нужен только если при создании SSH-ключа вы задавали пароль")
+                    },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    enabled = !isDeploying,
+                )
+            } else {
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = {
+                        password = it.filter { c -> !c.isWhitespace() }
+                        persistDeployFields()
+                    },
+                    label = { Text("Пароль SSH") },
+                    placeholder = { Text("password") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    enabled = !isDeploying,
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedTextField(
+                    value = dns1,
+                    onValueChange = {
+                        dns1 = it.filter { c -> !c.isWhitespace() }
+                        persistDeployFields()
+                    },
+                    label = { Text("DNS 1") },
+                    placeholder = { Text("1.1.1.1") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(16.dp),
+                    enabled = !isDeploying,
+                )
+                OutlinedTextField(
+                    value = dns2,
+                    onValueChange = {
+                        dns2 = it.filter { c -> !c.isWhitespace() }
+                        persistDeployFields()
+                    },
+                    label = { Text("DNS 2") },
+                    placeholder = { Text("1.0.0.1") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(16.dp),
+                    enabled = !isDeploying,
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Ручное управление портами",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f),
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Switch(
+                    checked = savedManualPorts,
+                    enabled = !isDeploying,
+                    onCheckedChange = { enabled ->
+                        scope.launch { settingsStore.saveManualPortsEnabled(enabled) }
+                    }
+                )
+            }
+        }
+        }
+
+        if (showSecretsDialog) {
+            DeploySecretsDialog(
+                settingsStore = settingsStore,
+                initialMainPass = savedMainPass,
+                initialAdminId = savedAdminId,
+                initialBotToken = savedBotToken,
+                initialSshPort = savedSshPort,
+                manualPortsEnabled = savedManualPorts,
+                initialServerDtlsPort = savedServerDtlsPort.toString(),
+                initialServerWgPort = savedServerWgPort.toString(),
+                onSaved = { _, _ -> },
+                onDismiss = { showSecretsDialog = false }
+            )
         }
 
         if (showUninstallDialog) {
@@ -369,12 +669,22 @@ fun DeployTab() {
                     val effectiveLogin = if (login.isBlank()) "root" else login
                     val effectiveDtlsPort = if (savedManualPorts) savedServerDtlsPort.coerceIn(1, 65535) else 56000
                     val effectiveWgPort = if (savedManualPorts) savedServerWgPort.coerceIn(1, 65535) else 56001
+                    val sshAuth = buildSshAuth(
+                        useKey = sshUseKey,
+                        password = password,
+                        privateKey = savedSshPrivateKey,
+                        keyPassphrase = sshKeyPassphrase,
+                    )
                     DeployManager.scope.launch {
                         try {
                             DeployManager.startDeploy()
                             performUninstall(
-                                host = ip, user = effectiveLogin, pass = password, port = savedSshPort.toIntOrNull() ?: 22,
-                                dtlsPort = effectiveDtlsPort, wgPort = effectiveWgPort,
+                                host = ip,
+                                user = effectiveLogin,
+                                port = savedSshPort.toIntOrNull() ?: 22,
+                                sshAuth = sshAuth,
+                                dtlsPort = effectiveDtlsPort,
+                                wgPort = effectiveWgPort,
                                 onProgress = { p, s -> DeployManager.updateProgress(p, s) }
                             )
                         } catch (_: Exception) {}
@@ -382,37 +692,32 @@ fun DeployTab() {
                 }
             )
         }
-
-        Spacer(modifier = Modifier.weight(1f))
-
-        // ═══ Success Banner ═══
-        if (showSuccessBanner) {
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                color = WDTTColors.connected.copy(alpha = 0.12f),
-                contentColor = MaterialTheme.colorScheme.onSurface,
-                border = BorderStroke(1.dp, WDTTColors.connected.copy(alpha = 0.4f))
-            ) {
-                Row(
-                    modifier = Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = WDTTColors.connected)
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text = "Деплой успешно завершен ($successCountdown)",
-                        color = WDTTColors.connected,
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                }
-            }
-        }
     }
 }
 
 // ==================== SSH ====================
+
+private data class SshAuth(
+    val password: String,
+    val privateKey: String,
+    val keyPassphrase: String,
+) {
+    val usesKey: Boolean get() = privateKey.isNotBlank()
+    val sudoPassword: String get() = password
+}
+
+private fun buildSshAuth(
+    useKey: Boolean,
+    password: String,
+    privateKey: String,
+    keyPassphrase: String,
+): SshAuth {
+    return if (useKey) {
+        SshAuth(password = password, privateKey = privateKey, keyPassphrase = keyPassphrase)
+    } else {
+        SshAuth(password = password, privateKey = "", keyPassphrase = "")
+    }
+}
 
 private class SSHClient(private val session: Session, private val pass: String) {
 
@@ -515,19 +820,38 @@ private class SSHClient(private val session: Session, private val pass: String) 
     }
 }
 
-private fun createSSHSession(host: String, user: String, pass: String, port: Int = 22): Session {
-    val jsch = JSch()
-    val session = jsch.getSession(user, host, port)
-    session.setPassword(pass)
-    session.setConfig(Properties().apply {
-        put("StrictHostKeyChecking", "no")
-        put("ServerAliveInterval", "10")
-        put("ServerAliveCountMax", "6")
-        put("ConnectTimeout", "15000")
-        put("PreferredAuthentications", "password,keyboard-interactive")
-    })
-    session.connect(20000)
-    return session
+private fun createSSHSession(host: String, user: String, port: Int, auth: SshAuth): Session {
+    val authMode = if (auth.usesKey) "SSH-ключ" else "пароль"
+    TunnelManager.addDeployLog("SSH $user@$host:$port ($authMode)…")
+    try {
+        val jsch = JSch()
+        if (auth.usesKey) {
+            val keyBytes = auth.privateKey.toByteArray(Charsets.UTF_8)
+            val passphraseBytes = auth.keyPassphrase.takeIf { it.isNotBlank() }?.toByteArray(Charsets.UTF_8)
+            jsch.addIdentity("deploy-key", keyBytes, null, passphraseBytes)
+        }
+        val session = jsch.getSession(user, host, port)
+        if (!auth.usesKey) {
+            session.setPassword(auth.password)
+        }
+        session.setConfig(Properties().apply {
+            put("StrictHostKeyChecking", "no")
+            put("ServerAliveInterval", "10")
+            put("ServerAliveCountMax", "6")
+            put("ConnectTimeout", "15000")
+            put(
+                "PreferredAuthentications",
+                if (auth.usesKey) "publickey" else "password,keyboard-interactive,publickey"
+            )
+        })
+        session.connect(20000)
+        TunnelManager.addDeployLog("SSH подключено")
+        return session
+    } catch (e: Exception) {
+        val msg = e.message?.take(160) ?: e.javaClass.simpleName
+        DeployManager.writeError("SSH не удалось: $msg")
+        throw e
+    }
 }
 
 private fun shellQuote(value: String): String {
@@ -567,7 +891,8 @@ private fun isUnsafeLegacyServerAsset(serverFile: File): Boolean {
 
 private suspend fun performDeploy(
     context: Context,
-    host: String, user: String, pass: String, port: Int,
+    host: String, user: String, port: Int,
+    sshAuth: SshAuth,
     mainPass: String, adminId: String, botToken: String,
     dtlsPort: Int, wgPort: Int, dns1: String, dns2: String,
     onProgress: (Float, String) -> Unit
@@ -575,9 +900,9 @@ private suspend fun performDeploy(
     var session: Session? = null
     try {
         onProgress(0.02f, "Подключение...")
-        session = createSSHSession(host, user, pass, port)
+        session = createSSHSession(host, user, port, sshAuth)
         DeployManager.activeSession = session
-        val ssh = SSHClient(session, pass)
+        val ssh = SSHClient(session, sshAuth.sudoPassword)
 
         onProgress(0.05f, "Подготовка файлов...")
         val passArg = if (mainPass.isNotBlank()) "-password \"$mainPass\" " else ""
@@ -644,16 +969,17 @@ private suspend fun performDeploy(
 // ==================== Uninstall ====================
 
 private suspend fun performUninstall(
-    host: String, user: String, pass: String, port: Int,
+    host: String, user: String, port: Int,
+    sshAuth: SshAuth,
     dtlsPort: Int, wgPort: Int,
     onProgress: (Float, String) -> Unit
 ) = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
         onProgress(0.05f, "Подключение...")
-        session = createSSHSession(host, user, pass, port)
+        session = createSSHSession(host, user, port, sshAuth)
         DeployManager.activeSession = session
-        val ssh = SSHClient(session, pass)
+        val ssh = SSHClient(session, sshAuth.sudoPassword)
 
         onProgress(0.15f, "Остановка сервиса...")
         ssh.exec(
@@ -945,7 +1271,7 @@ fun UninstallConfirmDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
                         )
                     ) {
                         Icon(Icons.Default.Delete, null, Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
                         Text("Удалить", fontWeight = FontWeight.Bold)
                     }
                 }

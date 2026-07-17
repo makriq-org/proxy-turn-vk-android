@@ -292,6 +292,7 @@ type TurnParams struct {
 	Port    string
 	Hashes  []string
 	WrapKey []byte // Password-derived WRAP key (32 bytes), nil = disabled
+	ObfsMode string // "audio" or "video" — RTP masking mode
 }
 
 // Credentials — учетные данные TURN

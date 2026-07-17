@@ -132,7 +132,9 @@ import androidx.compose.ui.platform.LocalDensity
 fun ProfilesTab(
     onProfileApplied: () -> Unit = {},
     importFileUri: android.net.Uri? = null,
-    onImportHandled: () -> Unit = {}
+    onImportHandled: () -> Unit = {},
+    requestCreateProfile: Boolean = false,
+    onCreateProfileHandled: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -150,6 +152,13 @@ fun ProfilesTab(
     val snackbarHostState = remember { SnackbarHostState() }
     var groupToExport by remember { mutableStateOf<ProfileGroup?>(null) }
     val globalHashes by settingsStore.globalVkHashes.collectAsStateWithLifecycle(initialValue = "")
+
+    LaunchedEffect(requestCreateProfile) {
+        if (requestCreateProfile) {
+            showCreateSheet = true
+            onCreateProfileHandled()
+        }
+    }
 
     val pingResults = com.wdtt.client.PingHelper.pingResults
     val pingingState = com.wdtt.client.PingHelper.pingingState
@@ -300,7 +309,7 @@ fun ProfilesTab(
         }
     }
 
-    var sortByPing by rememberSaveable { mutableStateOf(false) }
+    val sortByPing by settingsStore.sortProfilesByPing.collectAsStateWithLifecycle(initialValue = false)
     val displayProfiles = remember(profiles, pingResults.toMap(), sortByPing) {
         if (sortByPing) {
             profiles.sortedWith(compareBy<ConnectionProfile> {
@@ -1133,7 +1142,9 @@ fun ProfilesTab(
                 }
 
                 androidx.compose.material3.IconButton(
-                    onClick = { sortByPing = !sortByPing },
+                    onClick = {
+                        scope.launch { settingsStore.saveSortProfilesByPing(!sortByPing) }
+                    },
                     modifier = Modifier.background(
                         color = if (sortByPing) MaterialTheme.colorScheme.primaryContainer else androidx.compose.ui.graphics.Color.Transparent,
                         shape = androidx.compose.foundation.shape.CircleShape
@@ -1334,16 +1345,16 @@ fun ProfilesTab(
                                 textAlign = androidx.compose.ui.text.style.TextAlign.Center
                             )
 
-                            Row(
+                            Column(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 Button(
                                     onClick = {
                                         val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://t.me/darkbit_vpnbot"))
                                         context.startActivity(intent)
                                     },
-                                    modifier = Modifier.weight(1f),
+                                    modifier = Modifier.fillMaxWidth(),
                                     colors = androidx.compose.material3.ButtonDefaults.buttonColors(
                                         containerColor = MaterialTheme.colorScheme.surface,
                                         contentColor = MaterialTheme.colorScheme.primary
@@ -1352,15 +1363,20 @@ fun ProfilesTab(
                                     shape = RoundedCornerShape(12.dp),
                                     contentPadding = PaddingValues(vertical = 10.dp)
                                 ) {
-                                    Text("🤖 @darkbit_vpnbot", maxLines = 1, style = MaterialTheme.typography.labelSmall)
+                                    Text(
+                                        "🤖 @darkbit_vpnbot",
+                                        maxLines = 1,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
                                 }
-                                
+
                                 Button(
                                     onClick = {
                                         val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://t.me/sidylinkbot"))
                                         context.startActivity(intent)
                                     },
-                                    modifier = Modifier.weight(1f),
+                                    modifier = Modifier.fillMaxWidth(),
                                     colors = androidx.compose.material3.ButtonDefaults.buttonColors(
                                         containerColor = MaterialTheme.colorScheme.surface,
                                         contentColor = MaterialTheme.colorScheme.primary
@@ -1369,7 +1385,12 @@ fun ProfilesTab(
                                     shape = RoundedCornerShape(12.dp),
                                     contentPadding = PaddingValues(vertical = 10.dp)
                                 ) {
-                                    Text("🤖 @sidylinkbot", maxLines = 1, style = MaterialTheme.typography.labelSmall)
+                                    Text(
+                                        "🤖 @sidylinkbot",
+                                        maxLines = 1,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
                                 }
                             }
                         }

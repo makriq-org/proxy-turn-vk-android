@@ -146,7 +146,7 @@ func (d *Dispatcher) readLoop() {
 		}
 
 		d.clientAddr.Store(&addr)
-		atomic.AddInt64(&d.stats.TotalBytesUp, int64(n))
+		d.stats.TotalBytesUp.Add(int64(n))
 
 		if atomic.CompareAndSwapUint32(&d.firstPktUp, 0, 1) {
 			log.Printf("[ДИСП] [ДЕБАГ] Получен ПЕРВЫЙ пакет от локального WireGuard (%d байт) с адреса %s", n, addr.String())
@@ -226,7 +226,7 @@ func (d *Dispatcher) writeLoop() {
 					return
 				}
 			}
-			atomic.AddInt64(&d.stats.TotalBytesDown, int64(len(pkt)))
+			d.stats.TotalBytesDown.Add(int64(len(pkt)))
 			putPktBuf(pkt)
 		}
 	}

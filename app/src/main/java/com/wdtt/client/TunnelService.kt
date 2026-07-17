@@ -1,7 +1,6 @@
 package com.wdtt.client
 
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
@@ -12,6 +11,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.LinkProperties
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -25,8 +25,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collectLatest
 
-private const val TUNNEL_NOTIFICATION_CHANNEL_ID = "wdtt_tunnel_v4"
+private const val TUNNEL_NOTIFICATION_CHANNEL_ID = NotificationHelper.TUNNEL_CHANNEL_ID
 private const val TUNNEL_NOTIFICATION_ID = 1
 
 class TunnelService : Service() {
@@ -40,10 +41,15 @@ class TunnelService : Service() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var lastNetworkChangeTime = 0L
     private val activeNetworks = mutableSetOf<Network>()
+    private val networkFingerprints = mutableMapOf<Network, String>()
+    private var lastUnderlyingFingerprint = ""
     private var isTunnelPaused = false
+    private var lastVpnReconnectAttemptMs = 0L
+    private var wasOnWifi = false
 
     override fun onCreate() {
         super.onCreate()
+        NotificationHelper.ensureTunnelChannel(this)
         createNotificationChannel()
         // Сразу берем лок при создании
         acquireWakeLock()
@@ -65,10 +71,21 @@ class TunnelService : Service() {
                 TunnelManager.scope.launch {
                     try {
                         val store = SettingsStore(appContext)
+                        SettingsStore.awaitMigrations(appContext)
                         val basePeer = intent.getStringExtra("peer")?.takeIf { it.isNotEmpty() } ?: store.peer.first()
                         val manualPortsEnabled = store.manualPortsEnabled.first()
                         val serverDtlsPort = if (manualPortsEnabled) store.serverDtlsPort.first() else 56000
                         val peerWithPort = if (basePeer.isBlank()) basePeer else PeerAddress.ensurePort(basePeer, serverDtlsPort)
+                        val vkAnonPath = SettingsStore.normalizeVkAnonPath(
+                            intent.getStringExtra("vk_anon_path")?.takeIf { it.isNotEmpty() }
+                                ?: store.vkAnonPath.first()
+                        )
+                        val goDnsArg = intent.getStringExtra("go_dns_arg")?.takeIf { it.isNotEmpty() }
+                            ?: store.resolveGoDnsArg()
+                        val obfsMode = SettingsStore.normalizeObfsMode(
+                            intent.getStringExtra("obfs_mode")?.takeIf { it.isNotEmpty() }
+                                ?: store.obfsMode.first()
+                        )
                         
                         val params = TunnelParams(
                             peer = peerWithPort,
@@ -82,17 +99,16 @@ class TunnelService : Service() {
                             captchaMode = sanitizeCaptchaMode(intent.getStringExtra("captcha_mode")?.takeIf { it.isNotEmpty() } ?: store.captchaMode.first()),
                             captchaSolveMethod = intent.getStringExtra("captcha_solve_method")?.takeIf { it.isNotEmpty() } ?: store.captchaSolveMethod.first(),
                             vkAuthMode = intent.getStringExtra("vk_auth_mode")?.takeIf { it.isNotEmpty() } ?: store.vkAuthMode.first(),
-                            vkAnonPath = sanitizeVkAnonPath(intent.getStringExtra("vk_anon_path")?.takeIf { it.isNotEmpty() } ?: store.vkAnonPath.first()),
+                            vkAnonPath = vkAnonPath,
+                            goDnsArg = goDnsArg,
+                            obfsMode = obfsMode,
                             detailedLogs = store.detailedLogs.first()
                         )
                         launch(Dispatchers.Main) {
-                            if (intent.action == "START_FORCED") {
-                                TunnelManager.showBlockerWarning.value = false
-                                startTunnel(params, forceStart = true)
-                            } else {
-                                startTunnel(params, forceStart = false)
-                            }
+                            startTunnel(params, forceStart = intent.action == "START_FORCED")
                         }
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
                     } catch (e: Exception) {
                         launch(Dispatchers.Main) { stopTunnel() }
                     }
@@ -128,6 +144,7 @@ class TunnelService : Service() {
         TunnelManager.scope.launch {
             try {
                 val store = SettingsStore(appContext)
+                SettingsStore.awaitMigrations(appContext)
                 val basePeer = store.peer.first()
                 val manualPortsEnabled = store.manualPortsEnabled.first()
                 val serverDtlsPort = if (manualPortsEnabled) store.serverDtlsPort.first() else 56000
@@ -143,7 +160,9 @@ class TunnelService : Service() {
                     captchaMode = sanitizeCaptchaMode(store.captchaMode.first()),
                     captchaSolveMethod = store.captchaSolveMethod.first(),
                     vkAuthMode = store.vkAuthMode.first(),
-                    vkAnonPath = sanitizeVkAnonPath(store.vkAnonPath.first()),
+                    vkAnonPath = SettingsStore.normalizeVkAnonPath(store.vkAnonPath.first()),
+                    goDnsArg = store.resolveGoDnsArg(),
+                    obfsMode = SettingsStore.normalizeObfsMode(store.obfsMode.first()),
                     detailedLogs = store.detailedLogs.first()
                 )
                 if (params.peer.isNotEmpty() && params.vkHashes.isNotEmpty()) {
@@ -155,6 +174,8 @@ class TunnelService : Service() {
                         stopTunnel()
                     }
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 launch(Dispatchers.Main) {
                     stopTunnel()
@@ -164,6 +185,7 @@ class TunnelService : Service() {
     }
 
     private fun startTunnel(params: TunnelParams, forceStart: Boolean = false) {
+        wasOnWifi = isUnderlyingWifiActive()
         updateNotification("Подключение...")
         acquireWakeLock()
         acquireWifiLock()
@@ -172,7 +194,7 @@ class TunnelService : Service() {
         // Вызываем всегда — дёшево, а WebView создаётся на лету при каждом запросе капчи
         CaptchaWebViewManager.onTunnelStart(applicationContext)
 
-        TunnelManager.start(this, params, forceStart)
+        TunnelManager.start(this, params, isSwitching = false, forceStart = forceStart)
         startStatsUpdater()
     }
 
@@ -189,6 +211,7 @@ class TunnelService : Service() {
         getSystemService(NotificationManager::class.java).cancel(TUNNEL_NOTIFICATION_ID)
         TunnelWidgetProvider.updateWidgetState(applicationContext, false, "Нажмите для подключения")
         QuickToggleTileService.requestTileUpdate(applicationContext)
+        AppShortcuts.refreshAsync(applicationContext)
         stopSelf()
     }
 
@@ -201,29 +224,50 @@ class TunnelService : Service() {
                 super.onAvailable(network)
                 val wasEmpty = activeNetworks.isEmpty()
                 activeNetworks.add(network)
+                rememberNetworkFingerprint(network)
                 if (wasEmpty) {
                     if (isTunnelPaused) {
                         isTunnelPaused = false
                         Log.d("TunnelService", "Сеть появилась, возобновляем туннель")
+                        updateNotification("Переподключение...")
                         TunnelManager.resume()
-                        updateNotification("Подключение...")
                     } else {
-                        handleNetworkChange()
+                        noteUnderlyingNetworkChange()
                     }
                 } else {
-                    handleNetworkChange()
+                    noteUnderlyingNetworkChange()
                 }
             }
 
             override fun onLost(network: Network) {
                 super.onLost(network)
                 activeNetworks.remove(network)
+                networkFingerprints.remove(network)
                 if (activeNetworks.isEmpty() && TunnelManager.running.value && !isTunnelPaused) {
                     isTunnelPaused = true
+                    lastUnderlyingFingerprint = ""
                     Log.d("TunnelService", "Сеть потеряна, приостанавливаем туннель")
                     TunnelManager.pause()
-                    updateNotification("Ожидание сети (Фоновый сон)")
+                    updateNotification("Ожидание сети...")
+                } else {
+                    noteUnderlyingNetworkChange()
                 }
+            }
+
+            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                super.onCapabilitiesChanged(network, networkCapabilities)
+                if (network !in activeNetworks) return
+                val prev = networkFingerprints[network]
+                val next = rememberNetworkFingerprint(network)
+                if (prev != null && prev != next) {
+                    noteUnderlyingNetworkChange()
+                }
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                super.onLinkPropertiesChanged(network, linkProperties)
+                if (network !in activeNetworks) return
+                noteUnderlyingNetworkChange()
             }
         }
 
@@ -235,15 +279,93 @@ class TunnelService : Service() {
             .build()
             
         connectivityManager?.registerNetworkCallback(request, networkCallback!!)
+        wasOnWifi = isUnderlyingWifiActive()
+    }
+
+    /**
+     * Wi‑Fi для stop-on-Wi‑Fi: только валидированная сеть.
+     * Иначе на OnePlus Wi‑Fi уже в activeNetworks до переключения трафика.
+     */
+    private fun isUnderlyingWifiActive(): Boolean {
+        val cm = connectivityManager ?: return false
+        return activeNetworks.any { network ->
+            val caps = cm.getNetworkCapabilities(network) ?: return@any false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        }
+    }
+
+    private fun networkCapabilityFingerprint(caps: NetworkCapabilities): String {
+        val transports = buildList {
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) add("wifi")
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) add("cell")
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) add("eth")
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) add("vpn")
+        }.joinToString("+")
+        val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val internet = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        return "$transports|validated=$validated|internet=$internet"
+    }
+
+    private fun rememberNetworkFingerprint(network: Network): String {
+        val cm = connectivityManager ?: return ""
+        val caps = cm.getNetworkCapabilities(network) ?: return ""
+        val fingerprint = networkCapabilityFingerprint(caps)
+        networkFingerprints[network] = fingerprint
+        return fingerprint
+    }
+
+    private fun activeUnderlyingFingerprint(): String {
+        return activeNetworks.mapNotNull { network ->
+            networkFingerprints[network]?.let { fingerprint -> "$network:$fingerprint" }
+        }.sorted().joinToString("|")
+    }
+
+    private fun noteUnderlyingNetworkChange() {
+        val fingerprint = activeUnderlyingFingerprint()
+        if (fingerprint.isEmpty()) return
+        if (lastUnderlyingFingerprint.isEmpty()) {
+            lastUnderlyingFingerprint = fingerprint
+            return
+        }
+        if (fingerprint == lastUnderlyingFingerprint) return
+        lastUnderlyingFingerprint = fingerprint
+        handleNetworkChange()
     }
     
     private fun handleNetworkChange() {
         val now = System.currentTimeMillis()
-        if (now - lastNetworkChangeTime < 5000) return
+        if (now - lastNetworkChangeTime < 3000) return
         lastNetworkChangeTime = now
 
+        val nowOnWifi = isUnderlyingWifiActive()
+        val transitionedToWifi = nowOnWifi && !wasOnWifi
+        wasOnWifi = nowOnWifi
+
+        // Только переход «не Wi‑Fi → валидированный Wi‑Fi».
+        // Старт уже на Wi‑Fi не гасим — иначе нельзя пользоваться VPN дома.
+        if (transitionedToWifi && TunnelManager.running.value && !isTunnelPaused) {
+            TunnelManager.scope.launch {
+                val stopOnWifi = SettingsStore(applicationContext).stopOnWifi.first()
+                if (stopOnWifi) {
+                    Log.d("TunnelService", "Подключились к Wi-Fi — отключаем туннель по настройке")
+                    TunnelManager.addNetworkLog("[СЕТЬ] Wi‑Fi: туннель отключён (опция «Отключать на Wi‑Fi»)")
+                    launch(Dispatchers.Main) { stopTunnel() }
+                    return@launch
+                }
+                restartTransportIfRunning()
+            }
+            return
+        }
+
+        restartTransportIfRunning()
+    }
+
+    private fun restartTransportIfRunning() {
         if (TunnelManager.running.value && !isTunnelPaused) {
-            Log.d("TunnelService", "Сеть изменилась, мягкий перезапуск Go-клиента")
+            Log.d("TunnelService", "Сеть изменилась, переподключение транспорта и VPN")
+            updateNotification("Переподключение (смена сети)...")
             TunnelManager.restartTransport()
         }
     }
@@ -257,12 +379,6 @@ class TunnelService : Service() {
         }
     }
 
-    private fun sanitizeVkAnonPath(path: String?): String {
-        return when (path?.lowercase()) {
-            "legacy" -> "legacy"
-            else -> "vkcalls"
-        }
-    }
 
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
@@ -312,17 +428,55 @@ class TunnelService : Service() {
     private fun startStatsUpdater() {
         updateJob?.cancel()
         updateJob = TunnelManager.scope.launch(Dispatchers.Main) {
+            // Сторож следит за пропажей уже поднятого VPN-интерфейса, а не за его
+            // отсутствием во время подключения (капча, VK-креды и т.д.).
+            var wasEverUp = false
             delay(1000)
-            while (isActive) {
-                if (!TunnelManager.running.value && !isTunnelPaused) {
-                    // Туннель полностью остановлен (не на паузе) — убиваем сервис
-                    stopSelf()
-                    break
+
+            val reconnectObserver = launch {
+                TunnelManager.isReconnecting.collectLatest { reconnecting ->
+                    if (reconnecting && TunnelManager.running.value && !isTunnelPaused) {
+                        updateNotification("Переподключение...")
+                    }
                 }
-                if (!isTunnelPaused) {
-                    updateNotification(buildTunnelNotificationText())
+            }
+
+            try {
+                while (isActive) {
+                    if (!TunnelManager.running.value && !isTunnelPaused) {
+                        // Туннель полностью остановлен (не на паузе) — убиваем сервис
+                        stopSelf()
+                        break
+                    }
+                    if (TunnelManager.running.value && !isTunnelPaused) {
+                        val helper = WireGuardHelper(applicationContext)
+                        when (helper.watchdogState()) {
+                            WireGuardHelper.WatchdogState.UP -> wasEverUp = true
+                            WireGuardHelper.WatchdogState.DISABLED_BY_EMPTY_WHITELIST -> Unit
+                            WireGuardHelper.WatchdogState.DOWN -> {
+                                if (wasEverUp) {
+                                    val now = System.currentTimeMillis()
+                                    if (now - lastVpnReconnectAttemptMs >= 15_000) {
+                                        lastVpnReconnectAttemptMs = now
+                                        Log.w(
+                                            "TunnelService",
+                                            "VPN-интерфейс пропал — пробуем переподключение"
+                                        )
+                                        updateNotification("Переподключение VPN...")
+                                        TunnelManager.reconnectAll("пропал VPN-интерфейс")
+                                        wasEverUp = false
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (!isTunnelPaused && !TunnelManager.isReconnecting.value) {
+                        updateNotification(buildTunnelNotificationText())
+                    }
+                    delay(2000)
                 }
-                delay(2000)
+            } finally {
+                reconnectObserver.cancel()
             }
         }
     }
@@ -337,18 +491,7 @@ class TunnelService : Service() {
     }
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            TUNNEL_NOTIFICATION_CHANNEL_ID,
-            "qWDTT Туннель",
-            NotificationManager.IMPORTANCE_DEFAULT // ВАЖНО: DEFAULT, а не LOW, иначе на многих китайских прошивках иконка скрывается
-        ).apply {
-            description = "Уведомление о работе туннеля"
-            setShowBadge(false)
-            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-            setSound(null, null)
-            enableVibration(false)
-        }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        NotificationHelper.ensureTunnelChannel(this)
     }
 
     private fun createNotification(text: String, actionName: String = "STOP", actionTitle: String = "Отключить"): Notification {
@@ -377,12 +520,12 @@ class TunnelService : Service() {
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             // Категория SERVICE помогает системе понять важность
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setOnlyAlertOnce(true) // Не издавать звук и не будить экран при обновлении статистики!
-            .setSilent(true) // Делаем тихим само уведомление
-            .setShowWhen(false)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setShowWhen(true)
             .setUsesChronometer(false)
-            .setWhen(0L)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setWhen(System.currentTimeMillis())
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
     }
 
@@ -398,9 +541,11 @@ class TunnelService : Service() {
         if (lastNotificationText == text) return
         lastNotificationText = text
         val notification = createNotification(text)
-        getSystemService(NotificationManager::class.java).notify(TUNNEL_NOTIFICATION_ID, notification)
+        // Обновляем через startForeground — так надёжнее на Android 13+ и китайских прошивках.
+        startPersistentForeground(notification)
         TunnelWidgetProvider.updateWidgetState(applicationContext, TunnelManager.running.value, text)
         QuickToggleTileService.requestTileUpdate(applicationContext)
+        AppShortcuts.refreshAsync(applicationContext)
     }
 
     override fun onDestroy() {

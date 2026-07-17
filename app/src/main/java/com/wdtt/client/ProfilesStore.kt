@@ -266,6 +266,12 @@ class ProfilesStore(context: Context) {
         }
     }
 
+    data class SubscriptionAutoRefreshResult(
+        val refreshedOk: Int,
+        val failed: Int,
+        val skippedFresh: Int,
+    )
+
     suspend fun refreshAllSubscriptions(): Int = withContext(Dispatchers.IO) {
         var ok = 0
         subscriptions.first().forEach { sub ->
@@ -273,6 +279,34 @@ class ProfilesStore(context: Context) {
         }
         ok
     }
+
+    /**
+     * Тихое автообновление: только «устаревшие» по интервалу, либо все при [SettingsStore.SUB_AUTO_REFRESH_EVERY_OPEN].
+     * Не трогает свежие подписки. Вызывать когда туннель не запущен.
+     */
+    suspend fun autoRefreshSubscriptionsIfDue(intervalHours: Int): SubscriptionAutoRefreshResult =
+        withContext(Dispatchers.IO) {
+            if (intervalHours == SettingsStore.SUB_AUTO_REFRESH_NEVER) {
+                return@withContext SubscriptionAutoRefreshResult(0, 0, 0)
+            }
+            val all = subscriptions.first()
+            if (all.isEmpty()) return@withContext SubscriptionAutoRefreshResult(0, 0, 0)
+
+            val now = System.currentTimeMillis()
+            val due = if (intervalHours == SettingsStore.SUB_AUTO_REFRESH_EVERY_OPEN) {
+                all
+            } else {
+                val minAgeMs = intervalHours.coerceAtLeast(1) * 60L * 60L * 1000L
+                all.filter { now - it.lastSyncAt >= minAgeMs }
+            }
+            val skipped = all.size - due.size
+            var ok = 0
+            var fail = 0
+            due.forEach { sub ->
+                if (refreshSubscription(sub.id).isSuccess) ok++ else fail++
+            }
+            SubscriptionAutoRefreshResult(ok, fail, skipped)
+        }
 
     suspend fun isSubscriptionGroup(groupId: String): Boolean {
         if (groupId.isBlank()) return false

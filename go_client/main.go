@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 // CaptchaResultChan — канал для получения токена капчи из внешнего решателя (WebView)
@@ -55,10 +56,58 @@ func drainCaptchaResult() {
 	}
 }
 
+func runHashChecks(ctx context.Context, hashes []string) {
+	log.Printf("[CHECK] Проверка VK-хешей: %d", len(hashes))
+	for i, hash := range hashes {
+		fmt.Printf("HASH_CHECK_START|%d|%s\n", i+1, hash)
+		checkCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		_, _, turnURLs, err := GetCreds(checkCtx, hash, 9000+i)
+		cancel()
+
+		status, message := classifyHashCheckError(err)
+		if err == nil {
+			status = "ok"
+			message = fmt.Sprintf("TURN urls=%d", len(turnURLs))
+		}
+		fmt.Printf("HASH_CHECK|%d|%s|%s|%s\n", i+1, hash, status, sanitizeHashCheckMessage(message))
+	}
+}
+
+func classifyHashCheckError(err error) (string, string) {
+	if err == nil {
+		return "ok", ""
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "captcha_required") || strings.Contains(text, "captcha_wait_required"):
+		return "captcha", "VK просит капчу"
+	case strings.Contains(text, "call not found") ||
+		strings.Contains(text, "joinconversationbylink") ||
+		strings.Contains(text, "missing turn_server") ||
+		strings.Contains(text, "9000") ||
+		strings.Contains(text, "callunavailable"):
+		return "dead", "Звонок не найден или закрыт"
+	case strings.Contains(text, "flood") || strings.Contains(text, "rate limit") || strings.Contains(text, "error_code:29"):
+		return "limited", "VK временно ограничил запросы"
+	case strings.Contains(text, "timeout") || strings.Contains(text, "deadline") || strings.Contains(text, "lookup") || strings.Contains(text, "network"):
+		return "network", "Сетевая ошибка"
+	default:
+		return "error", err.Error()
+	}
+}
+
+func sanitizeHashCheckMessage(message string) string {
+	message = strings.ReplaceAll(message, "\n", " ")
+	message = strings.ReplaceAll(message, "\r", " ")
+	message = strings.ReplaceAll(message, "|", "/")
+	if len(message) > 180 {
+		return message[:180]
+	}
+	return message
+}
+
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-
-	setupGlobalResolver()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -125,8 +174,12 @@ func main() {
 	vkAuthMode := flag.String("vk-auth", "anonymous", "режим VK авторизации (account/anonymous)")
 	vkAnonPath := flag.String("vk-anon-path", "vkcalls", "анонимный путь VK TURN (vkcalls/legacy)")
 	vkCredsFile := flag.String("vk-creds-file", "", "файл с TURN кредами от аккаунта VK")
+	goDNS := flag.String("go-dns", "yandex", "DNS для VK (yandex/cloudflare/google, doh-yandex/doh-cloudflare/doh-google, custom:IP или doh:URL)")
+	obfsMode := flag.String("obfs", "audio", "режим обфускации (audio/video)")
+	checkHashes := flag.Bool("check-hashes", false, "проверить VK-хеши и выйти")
 
 	flag.Parse()
+	setupGlobalResolver(*goDNS)
 	activeCaptchaMode := setCaptchaMode(*captchaMode)
 	activeVkAuthMode := setVkAuthMode(*vkAuthMode)
 	activeVkAnonPath := setVkAnonPath(*vkAnonPath)
@@ -134,6 +187,21 @@ func main() {
 	if err := loadVkCredsFile(*vkCredsFile); err != nil {
 		log.Fatalf("[КЛИЕНТ] Ошибка чтения vk-creds-file: %v", err)
 	}
+
+	hashes := ParseHashes(*vkHash)
+	if *checkHashes {
+		if len(hashes) == 0 {
+			log.Fatal("[CHECK] Нужен -vk со списком хешей")
+		}
+		log.Printf("[КЛИЕНТ] VK auth mode: %s (hash-check)", activeVkAuthMode)
+		if activeVkAuthMode == "anonymous" {
+			log.Printf("[КЛИЕНТ] VK anon path: %s", activeVkAnonPath)
+		}
+		log.Printf("[КЛИЕНТ] Captcha mode: %s", activeCaptchaMode)
+		runHashChecks(ctx, hashes)
+		return
+	}
+
 	log.Printf("[КЛИЕНТ] VK auth mode: %s", activeVkAuthMode)
 	if activeVkAuthMode == "anonymous" {
 		log.Printf("[КЛИЕНТ] VK anon path: %s", activeVkAnonPath)
@@ -148,7 +216,6 @@ func main() {
 		log.Fatalf("[КЛИЕНТ] Ошибка разбора пира: %v", err)
 	}
 
-	hashes := ParseHashes(*vkHash)
 	if len(hashes) == 0 {
 		log.Fatal("[КЛИЕНТ] Нет хешей VK")
 	}
@@ -185,10 +252,11 @@ func main() {
 	}
 
 	tp := &TurnParams{
-		Host:    *host,
-		Port:    *port,
-		Hashes:  hashes,
-		WrapKey: wrapKey,
+		Host:     *host,
+		Port:     *port,
+		Hashes:   hashes,
+		WrapKey:  wrapKey,
+		ObfsMode: normalizeObfsMode(*obfsMode),
 	}
 
 	if *pingOnly {

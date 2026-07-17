@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -50,14 +51,30 @@ type ObfsConfig struct {
 }
 
 // NewObfsConfig creates a config with random SSRC and sane defaults.
-func NewObfsConfig() *ObfsConfig {
+// mode: "audio" (OPUS-like, PT 111) or "video" (H264-like, PT 96).
+func NewObfsConfig(mode string) *ObfsConfig {
 	var buf [4]byte
 	rand.Read(buf[:])
+
+	pt := uint8(111)
+	pad := 24
+	if normalizeObfsMode(mode) == "video" {
+		pt = 96
+		pad = 60
+	}
+
 	return &ObfsConfig{
 		SSRC:        binary.BigEndian.Uint32(buf[:]),
-		PayloadType: 111, // dynamic PT for OPUS
-		PaddingMax:  24,
+		PayloadType: pt,
+		PaddingMax:  pad,
 	}
+}
+
+func normalizeObfsMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "video") {
+		return "video"
+	}
+	return "audio"
 }
 
 // ─── Per-direction state (sequence + timestamp counters) ───
@@ -224,7 +241,7 @@ func obfsIsRTPPacket(wire []byte) bool {
 	if (wire[0] >> 6) != 2 {
 		return false
 	}
-	// Our payload type = 111
+	// Our payload types: 111 (audio) or 96 (video)
 	pt := wire[1] & 0x7F
-	return pt == 111
+	return pt == 111 || pt == 96
 }

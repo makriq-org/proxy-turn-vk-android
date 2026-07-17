@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"math/rand"
 	"os"
 )
@@ -21,7 +22,10 @@ type SavedProfile struct {
 	BrowserFp  string `json:"browser_fp"`
 }
 
-const profileFile = "vk_profile.json"
+const (
+	profileFile         = "vk_profile.json"
+	captchaBrowserFpFile = "captcha_browser_fp"
+)
 
 func LoadProfileFromDisk() (*SavedProfile, error) {
 	data, err := os.ReadFile(profileFile)
@@ -35,7 +39,36 @@ func LoadProfileFromDisk() (*SavedProfile, error) {
 	return &sp, nil
 }
 
+// rotateCaptchaBrowserFP — полная ротация профиля капчи (fp + UA + device_json).
+func rotateCaptchaBrowserFP() (*SavedProfile, error) {
+	return rotateCaptchaProfile()
+}
 
+func rotateCaptchaProfile() (*SavedProfile, error) {
+	fp, err := captchaV2BrowserFP()
+	if err != nil {
+		return nil, err
+	}
+	p := getRandomProfile()
+	deviceJSON := captchaV2VariedDeviceJSON(captchaV2DeviceInfo)
+	sp := &SavedProfile{
+		Profile:    p,
+		DeviceJSON: deviceJSON,
+		BrowserFp:  fp,
+	}
+	data, err := json.Marshal(sp)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(profileFile, data, 0644); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(captchaBrowserFpFile, []byte(fp), 0644); err != nil {
+		return nil, err
+	}
+	log.Printf("[КАПЧА] captcha profile rotated (fp=%s...)", fp[:8])
+	return sp, nil
+}
 
 // profileList contains paired User-Agent and Client Hints strings.
 var profileList = []Profile{

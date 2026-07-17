@@ -73,16 +73,7 @@ fun GroupManagementDialog(
                                         modifier = Modifier.size(20.dp)
                                     )
                                     Spacer(Modifier.width(12.dp))
-                                    Column {
-                                        Text(group.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
-                                        if (isSubscription) {
-                                            Text(
-                                                "Подписка — управляется на вкладке профилей",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                                            )
-                                        }
-                                    }
+                                    Text(group.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
                                 }
                                 Row {
                                     IconButton(onClick = { onExportGroup(group) }, modifier = Modifier.size(36.dp)) {
@@ -92,9 +83,9 @@ fun GroupManagementDialog(
                                         IconButton(onClick = { editGroup = group }, modifier = Modifier.size(36.dp)) {
                                             Icon(Icons.Filled.Edit, contentDescription = "Переименовать", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
                                         }
-                                        IconButton(onClick = { deleteGroup = group }, modifier = Modifier.size(36.dp)) {
-                                            Icon(Icons.Filled.Delete, contentDescription = "Удалить", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
-                                        }
+                                    }
+                                    IconButton(onClick = { deleteGroup = group }, modifier = Modifier.size(36.dp)) {
+                                        Icon(Icons.Filled.Delete, contentDescription = "Удалить", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
                                     }
                                 }
                             }
@@ -162,15 +153,25 @@ fun GroupManagementDialog(
     }
 
     if (deleteGroup != null) {
+        val target = deleteGroup!!
+        val isSubDelete = subscriptionGroupIds.contains(target.id)
         AlertDialog(
             onDismissRequest = { deleteGroup = null },
-            title = { Text("Удалить папку?") },
-            text = { Text("Папка «${deleteGroup?.name}» и все профили в ней будут удалены без возможности восстановления.") },
+            title = { Text(if (isSubDelete) "Удалить подписку?" else "Удалить папку?") },
+            text = {
+                Text(
+                    if (isSubDelete) {
+                        "Подписка «${target.name}» и все её профили будут удалены."
+                    } else {
+                        "Папка «${target.name}» и все профили в ней будут удалены без возможности восстановления."
+                    }
+                )
+            },
             confirmButton = {
                 Button(
                     onClick = {
                         scope.launch {
-                            profilesStore.deleteGroup(deleteGroup!!.id)
+                            profilesStore.deleteGroup(target.id)
                             deleteGroup = null
                         }
                     },
