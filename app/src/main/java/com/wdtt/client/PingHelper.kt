@@ -69,7 +69,7 @@ object PingHelper {
 
             // Read merged stdout+stderr synchronously (since redirectErrorStream=true)
             val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val outputJob = launch(Dispatchers.IO) {
+            launch(Dispatchers.IO) {
                 try {
                     reader.forEachLine { line ->
                         android.util.Log.d("PingHelper", "OUTPUT: $line")

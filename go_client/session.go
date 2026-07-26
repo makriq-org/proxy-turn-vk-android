@@ -15,6 +15,7 @@ import (
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/logging"
+	"github.com/pion/transport/v4/stdnet"
 	"github.com/pion/turn/v5"
 )
 
@@ -113,11 +114,15 @@ func RunSession(
 		addrFamily = turn.RequestedAddressFamilyIPv6
 	}
 
-	// TURN Client (pion/turn/v5)
+	// Pion's default stdnet.NewNet enumerates network interfaces through
+	// NETLINK_ROUTE. Some Huawei/Honor ROMs deny that operation to apps.
+	// The zero-value stdnet.Net provides everything this UDP client uses
+	// without performing the unnecessary interface enumeration.
 	tc, err := turn.NewClient(&turn.ClientConfig{
 		STUNServerAddr:         turnAddr,
 		TURNServerAddr:         turnAddr,
 		Conn:                   turnConn,
+		Net:                    new(stdnet.Net),
 		Username:               creds.User,
 		Password:               creds.Pass,
 		RequestedAddressFamily: addrFamily,
@@ -488,6 +493,7 @@ func RunPing(
 		STUNServerAddr:         turnAddr,
 		TURNServerAddr:         turnAddr,
 		Conn:                   turnConn,
+		Net:                    new(stdnet.Net),
 		Username:               creds.User,
 		Password:               creds.Pass,
 		RequestedAddressFamily: addrFamily,

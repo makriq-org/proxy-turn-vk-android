@@ -2,7 +2,6 @@ package com.wdtt.client.ui
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -18,7 +17,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
@@ -30,9 +28,9 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Verified
-import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material.icons.filled.WifiOff
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -44,13 +42,13 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -58,7 +56,6 @@ import com.wdtt.client.PeerAddress
 import com.wdtt.client.SettingsStore
 import com.wdtt.client.TunnelManager
 import com.wdtt.client.TunnelService
-import com.wdtt.client.WDTTColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -99,7 +96,8 @@ fun SettingsTab(
     onDynamicColorChange: (Boolean) -> Unit,
     currentPalette: String,
     onPaletteChange: (String) -> Unit,
-    onConnectRequested: () -> Unit = {}
+    onConnectRequested: () -> Unit = {},
+    onOpenProfiles: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -119,7 +117,8 @@ fun SettingsTab(
             onDynamicColorChange = onDynamicColorChange,
             currentPalette = currentPalette,
             onPaletteChange = onPaletteChange,
-            onConnectRequested = onConnectRequested
+            onConnectRequested = onConnectRequested,
+            onOpenProfiles = onOpenProfiles,
         )
     }
 }
@@ -127,7 +126,7 @@ fun SettingsTab(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsTabContent(
-    context: android.content.Context,
+    context: Context,
     scope: kotlinx.coroutines.CoroutineScope,
     settingsStore: SettingsStore,
     themeMode: String,
@@ -136,7 +135,8 @@ fun SettingsTabContent(
     onDynamicColorChange: (Boolean) -> Unit,
     currentPalette: String,
     onPaletteChange: (String) -> Unit,
-    onConnectRequested: () -> Unit = {}
+    onConnectRequested: () -> Unit = {},
+    onOpenProfiles: () -> Unit = {},
 ) {
     val savedConnectionPassword by settingsStore.connectionPassword.collectAsStateWithLifecycle(initialValue = "")
     val savedManualPortsEnabled by settingsStore.manualPortsEnabled.collectAsStateWithLifecycle(initialValue = false)
@@ -146,7 +146,8 @@ fun SettingsTabContent(
 
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
     val tunnelConnecting by TunnelManager.isConnecting.collectAsStateWithLifecycle()
-    val tunnelBusy = tunnelRunning || tunnelConnecting
+    val tunnelReconnecting by TunnelManager.isReconnecting.collectAsStateWithLifecycle()
+    tunnelRunning || tunnelConnecting
     var connectCancelArmed by remember { mutableStateOf(false) }
     LaunchedEffect(tunnelConnecting, tunnelRunning) {
         connectCancelArmed = false
@@ -159,6 +160,14 @@ fun SettingsTabContent(
     }
     val autoSwitchToLogs by settingsStore.autoSwitchToLogs.collectAsStateWithLifecycle(initialValue = true)
     val stopOnWifi by settingsStore.stopOnWifi.collectAsStateWithLifecycle(initialValue = false)
+    val connectionPipelineEnabled by settingsStore.connectionPipelineEnabled.collectAsStateWithLifecycle(initialValue = true)
+    val connectionMode by settingsStore.connectionMode.collectAsStateWithLifecycle(
+        initialValue = SettingsStore.CONNECTION_MODE_VPN
+    )
+    val socksPort by settingsStore.socksPort.collectAsStateWithLifecycle(
+        initialValue = SettingsStore.DEFAULT_SOCKS_PORT
+    )
+    var socksPortInput by rememberSaveable { mutableStateOf(SettingsStore.DEFAULT_SOCKS_PORT.toString()) }
     val detailedLogs by settingsStore.detailedLogs.collectAsStateWithLifecycle(initialValue = false)
     val updateCheckIntervalHours by settingsStore.updateCheckIntervalHours.collectAsStateWithLifecycle(
         initialValue = com.wdtt.client.DEFAULT_UPDATE_CHECK_INTERVAL_HOURS
@@ -188,10 +197,6 @@ fun SettingsTabContent(
     }
 
     var peerInput by rememberSaveable { mutableStateOf("") }
-    var vkHash1 by rememberSaveable { mutableStateOf("") }
-    var vkHash2 by rememberSaveable { mutableStateOf("") }
-    var vkHash3 by rememberSaveable { mutableStateOf("") }
-    var vkHash4 by rememberSaveable { mutableStateOf("") }
     var workersInput by rememberSaveable { mutableFloatStateOf(18f) }
     var showHashesDialog by rememberSaveable { mutableStateOf(false) }
     var autoCaptchaEnabled by rememberSaveable { mutableStateOf(true) }
@@ -226,14 +231,16 @@ fun SettingsTabContent(
         if (vkAccountAuth) SettingsStore.VK_ACCOUNT_MAX_WORKERS.toFloat()
         else SettingsStore.maxAnonymousWorkers(filledHashCount.coerceAtLeast(1)).toFloat()
     }
-    
-    val globalHashesRaw by settingsStore.globalVkHashes.collectAsStateWithLifecycle(initialValue = "")
+
     val vkAnonPath by settingsStore.vkAnonPath.collectAsStateWithLifecycle(initialValue = "vkcalls")
     val goDnsPreset by settingsStore.goDnsPreset.collectAsStateWithLifecycle(initialValue = "yandex")
     val goDnsCustomStored by settingsStore.goDnsCustom.collectAsStateWithLifecycle(initialValue = "")
     val goDnsDohCustomStored by settingsStore.goDnsDohCustom.collectAsStateWithLifecycle(initialValue = "")
     val obfsMode by settingsStore.obfsMode.collectAsStateWithLifecycle(initialValue = "audio")
     val interfaceRole by settingsStore.interfaceRole.collectAsStateWithLifecycle(initialValue = "admin")
+    LaunchedEffect(socksPort) {
+        socksPortInput = socksPort.toString()
+    }
     var goDnsCustomInput by rememberSaveable { mutableStateOf("") }
     var goDnsDohCustomInput by rememberSaveable { mutableStateOf("") }
     val useVKCallsAuth = !vkAnonPath.equals("legacy", ignoreCase = true)
@@ -307,7 +314,7 @@ fun SettingsTabContent(
             settingsStore.savePorts(embeddedPort, serverWgPort, port)
             settingsStore.save(
                 PeerAddress.host(peer), hashes, "",
-                workers, "udp", port, sni, false
+                workers, "udp", port, sni
             )
         }
         sniInput = sni
@@ -415,7 +422,7 @@ fun SettingsTabContent(
             val host = PeerAddress.host(peerInput.trim())
             settingsStore.save(
                 host, hashes, "",
-                finalWorkers, "udp", savedLocalPort, sniInput, false
+                finalWorkers, "udp", savedLocalPort, sniInput
             )
             onSaved?.invoke()
         }
@@ -433,7 +440,7 @@ fun SettingsTabContent(
             val host = PeerAddress.host(peerInput.trim())
             settingsStore.save(
                 host, combinedHashes, "",
-                finalWorkers, "udp", savedLocalPort, sniInput, false
+                finalWorkers, "udp", savedLocalPort, sniInput
             )
         }
     }
@@ -460,7 +467,7 @@ fun SettingsTabContent(
             val effectiveVkAnonPath = SettingsStore.resolveVkAnonPath(context)
             settingsStore.save(
                 host, combinedHashes, "",
-                finalWorkers, "udp", effectiveLocalPort, sniInput, false
+                finalWorkers, "udp", effectiveLocalPort, sniInput
             )
             settingsStore.saveCaptchaMode(effectiveCaptchaMode)
             settingsStore.saveCaptchaSolveMethod(effectiveCaptchaSolveMethod)
@@ -481,6 +488,8 @@ fun SettingsTabContent(
                 putExtra("vk_anon_path", effectiveVkAnonPath)
                 putExtra("go_dns_arg", effectiveGoDns)
                 putExtra("obfs_mode", obfsMode)
+                putExtra("connection_mode", connectionMode)
+                putExtra("socks_port", SettingsStore.normalizeSocksPort(socksPortInput.toIntOrNull() ?: socksPort))
             }
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
             else context.startService(intent)
@@ -496,6 +505,10 @@ fun SettingsTabContent(
                 onConnectRequested()
             }
             startTunnelService()
+        }
+        if (connectionMode == SettingsStore.CONNECTION_MODE_SOCKS) {
+            proceed()
+            return
         }
         val activity = context as? com.wdtt.client.MainActivity
         if (activity != null) {
@@ -763,6 +776,38 @@ fun SettingsTabContent(
                     ) {
                         Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
                             Text(
+                                "Схема подключения",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                "Показывать этапы DNS → VK → DTLS → VPN на вкладке «Логи»",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = connectionPipelineEnabled,
+                            onCheckedChange = { enabled ->
+                                scope.launch {
+                                    settingsStore.saveConnectionPipelineEnabled(enabled)
+                                    if (!enabled) {
+                                        TunnelManager.hideConnectionPipelineForSettings()
+                                    }
+                                }
+                            }
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                            Text(
                                 "Отключать на Wi-Fi",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Medium
@@ -879,8 +924,6 @@ fun SettingsTabContent(
                             }
                         )
                     }
-
-                    // Removed BS check toggle
 
                     Spacer(modifier = Modifier.height(10.dp))
 
@@ -1073,12 +1116,123 @@ fun SettingsTabContent(
 
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(
+                            "Режим подключения",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            "VPN — весь трафик через туннель. SOCKS5 — без VPN-разрешения; укажите прокси вручную в приложении (Telegram и т.п.).",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            FilterChip(
+                                selected = connectionMode == SettingsStore.CONNECTION_MODE_VPN,
+                                onClick = {
+                                    if (!tunnelRunning) {
+                                        scope.launch { settingsStore.saveConnectionMode(SettingsStore.CONNECTION_MODE_VPN) }
+                                    }
+                                },
+                                label = { Text("VPN") },
+                                enabled = !tunnelRunning,
+                                modifier = Modifier.weight(1f)
+                            )
+                            FilterChip(
+                                selected = connectionMode == SettingsStore.CONNECTION_MODE_SOCKS,
+                                onClick = {
+                                    if (!tunnelRunning) {
+                                        scope.launch { settingsStore.saveConnectionMode(SettingsStore.CONNECTION_MODE_SOCKS) }
+                                    }
+                                },
+                                label = { Text("SOCKS5") },
+                                enabled = !tunnelRunning,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        if (connectionMode == SettingsStore.CONNECTION_MODE_SOCKS) {
+                            val socksAddr = SettingsStore.socksListenAddress(
+                                socksPortInput.toIntOrNull() ?: socksPort
+                            )
+                            OutlinedTextField(
+                                value = socksPortInput,
+                                onValueChange = { value ->
+                                    if (value.all { it.isDigit() } && value.length <= 5) {
+                                        socksPortInput = value
+                                        value.toIntOrNull()?.let { port ->
+                                            scope.launch { settingsStore.saveSocksPort(port) }
+                                        }
+                                    }
+                                },
+                                label = { Text("Порт SOCKS5") },
+                                singleLine = true,
+                                enabled = !tunnelRunning,
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(14.dp),
+                            )
+                            Surface(
+                                onClick = {
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    clipboard.setPrimaryClip(android.content.ClipData.newPlainText("socks", socksAddr))
+                                    Toast.makeText(context, "Скопировано: $socksAddr", Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(14.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f),
+                                border = BorderStroke(
+                                    1.dp,
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.35f),
+                                ),
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            "Адрес прокси",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                        Text(
+                                            socksAddr,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.SemiBold,
+                                            fontFamily = FontFamily.Monospace,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                        )
+                                    }
+                                    Icon(
+                                        imageVector = Icons.Default.ContentCopy,
+                                        contentDescription = "Копировать",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(20.dp),
+                                    )
+                                }
+                            }
+                        }
+                        if (tunnelRunning) {
+                            Text(
+                                "Смена режима — после отключения туннеля",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
                             "Маскировка трафика",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Medium
                         )
                         Text(
-                            "RTP-пакеты под аудио (OPUS) или видео (H.264) звонок VK. Сервер подстраивается под выбранный режим.",
+                            "RTP-пакеты под аудио (OPUS) или видео (H.264) звонок VK.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -1222,7 +1376,7 @@ fun SettingsTabContent(
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Icon(
-                                        imageVector = androidx.compose.material.icons.Icons.Filled.Info,
+                                        imageVector = Icons.Filled.Info,
                                         contentDescription = null,
                                         tint = MaterialTheme.colorScheme.primary,
                                         modifier = Modifier.size(20.dp)
@@ -1248,7 +1402,7 @@ fun SettingsTabContent(
                                 ) {
                                     Button(
                                         onClick = {
-                                            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://t.me/darkbit_vpnbot"))
+                                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/darkbit_vpnbot"))
                                             context.startActivity(intent)
                                         },
                                         modifier = Modifier.fillMaxWidth(),
@@ -1270,7 +1424,7 @@ fun SettingsTabContent(
 
                                     Button(
                                         onClick = {
-                                            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://t.me/sidylinkbot"))
+                                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/sidylinkbot"))
                                             context.startActivity(intent)
                                         },
                                         modifier = Modifier.fillMaxWidth(),
@@ -1383,7 +1537,7 @@ fun SettingsTabContent(
                                     Архитектура (ABI): ${Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"}
                                     Устройство: ${Build.MANUFACTURER} ${Build.MODEL}
                                 """.trimIndent()
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                 clipboard.setPrimaryClip(ClipData.newPlainText("qWDTT Report", reportText))
                                 Toast.makeText(context, "Отчёт о системе скопирован!", Toast.LENGTH_SHORT).show()
                             },
@@ -1528,7 +1682,7 @@ fun SettingsTabContent(
                                             context.startService(
                                                 Intent(context, TunnelService::class.java).apply { action = "STOP" }
                                             )
-                                            kotlinx.coroutines.delay(800)
+                                            delay(800)
                                             requestVpnAndStart()
                                         }
 
@@ -1544,6 +1698,51 @@ fun SettingsTabContent(
                                 }
                             )
                         }
+                    }
+                }
+            } else {
+                Surface(
+                    onClick = onOpenProfiles,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.22f),
+                    border = BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.35f),
+                    ),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Icon(
+                            Icons.Default.FolderOpen,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(22.dp),
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Нет серверов",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            Text(
+                                "Добавьте или импортируйте профиль во вкладке «Профили»",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Icon(
+                            Icons.Default.ChevronRight,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
                     }
                 }
             }
@@ -1575,7 +1774,7 @@ fun SettingsTabContent(
                 Button(
                     onClick = {
                         when {
-                            tunnelRunning || (tunnelConnecting && connectCancelArmed) -> {
+                            tunnelRunning || tunnelReconnecting || (tunnelConnecting && connectCancelArmed) -> {
                                 context.startService(
                                     Intent(context, TunnelService::class.java).apply { action = "STOP" }
                                 )
@@ -1588,8 +1787,9 @@ fun SettingsTabContent(
                             }
                         }
                     },
-                    enabled = (isValid && cooldownSeconds == 0 && !tunnelConnecting) ||
+                    enabled = (isValid && cooldownSeconds == 0 && !tunnelConnecting && !tunnelReconnecting) ||
                         tunnelRunning ||
+                        tunnelReconnecting ||
                         (tunnelConnecting && connectCancelArmed),
                     modifier = Modifier
                         .weight(1f)
@@ -1602,7 +1802,7 @@ fun SettingsTabContent(
                 ) {
                     Icon(
                         imageVector = when {
-                            tunnelRunning || (tunnelConnecting && connectCancelArmed) -> Icons.Default.Stop
+                            tunnelRunning || tunnelReconnecting || (tunnelConnecting && connectCancelArmed) -> Icons.Default.Stop
                             else -> Icons.Default.PowerSettingsNew
                         },
                         contentDescription = null,
@@ -1611,6 +1811,7 @@ fun SettingsTabContent(
                     Spacer(Modifier.width(8.dp))
                     Text(
                         text = when {
+                            tunnelReconnecting -> "Переподключение…"
                             tunnelConnecting && !tunnelRunning && !connectCancelArmed -> "Подключение…"
                             tunnelConnecting && !tunnelRunning -> "Отмена"
                             tunnelRunning -> "Остановить"
@@ -2099,75 +2300,6 @@ private fun CompactSteppedSlider(
     )
 }
 
-// ═══ Important Info Dialog ═══
-@Composable
-fun ImportantInfoDialog(onDismiss: () -> Unit) {
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
-    ) {
-        Surface(
-            modifier = Modifier.fillMaxWidth(0.95f).padding(8.dp),
-            shape = RoundedCornerShape(24.dp),
-            color = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            tonalElevation = 6.dp,
-        ) {
-            Column(modifier = Modifier.padding(24.dp).verticalScroll(rememberScrollState())) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Важная информация", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.Close, null)
-                    }
-                }
-
-                Spacer(Modifier.height(16.dp))
-
-                InfoSection("Капча ВК",
-                    "По умолчанию в приложении установлен ручной режим (WBV + РУЧ), но его можно заменить на RJS-АВТ. Это продвинутый автоматический метод решения капчи без всплывающих окон и участия человека, основанный на реверс-инжиниринге JS-кода капчи. Он имитирует действия пользователя в фоновом режиме, обеспечивая бесперебойную работу.\n\nВАЖНО: Если в вашем случае RJS не проходит капчу или выдает ошибки (проблемы со связью или изменения на стороне ВК) — переключитесь обратно в ручной режим."
-                )
-                InfoSection("Как решать капчу",
-                    "Она не сложная: нужно просто потянуть слайдер вправо так, чтобы все элементы (обычно это 3 слова) идеально сошлись в пазле."
-                )
-                InfoSection("Сетевое окружение",
-                    "Отключите другие VPN/Прокси и «Приватный DNS» перед использованием."
-                )
-                InfoSection("Связь потоков и капч",
-                    "Рекомендую выбирать 12-36 потока для меньшего количества капч. Если вам всё равно на частоту ввода капчи в фоне — ставьте 48 и более ради скорости."
-                )
-
-                Spacer(Modifier.height(20.dp))
-                Button(
-                    onClick = onDismiss,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary)
-                ) {
-                    Text("Понятно")
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun InfoSection(title: String, body: String) {
-    Spacer(Modifier.height(12.dp))
-    Text(
-        title,
-        style = MaterialTheme.typography.titleMedium,
-        color = MaterialTheme.colorScheme.primary,
-        fontWeight = FontWeight.Bold
-    )
-    Spacer(Modifier.height(4.dp))
-    Text(body, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
-    Spacer(Modifier.height(4.dp))
-}
-
 // Округление до ближайшего кратного WORKERS_PER_GROUP (анонимный режим) или 1..max (аккаунт VK)
 private fun roundToGroup(value: Float, maxW: Float = 96f, accountMode: Boolean = false): Float {
     if (accountMode || maxW < WORKERS_PER_GROUP) {
@@ -2221,7 +2353,7 @@ fun HashesDialog(
     val badCount = checkResults.values.count {
         it.status in setOf("dead", "error", "network", "limited", "captcha")
     }
-    val tunnelBusy = TunnelManager.running.value
+    val tunnelBusy by TunnelManager.running.collectAsStateWithLifecycle()
     val vkLoggedIn = remember { mutableStateOf(VkAuthWebViewManager.hasVkSessionCookie()) }
     LaunchedEffect(Unit) {
         vkLoggedIn.value = VkAuthWebViewManager.hasVkSessionCookie()
@@ -2650,7 +2782,7 @@ private fun HashSlotCard(
     )
 }
 
-private fun copyText(context: android.content.Context, label: String, value: String) {
+private fun copyText(context: Context, label: String, value: String) {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     clipboard.setPrimaryClip(ClipData.newPlainText(label, value))
     Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
@@ -2813,7 +2945,7 @@ private fun PaletteCircleOption(
         baseModifier
     }
 
-    androidx.compose.foundation.layout.Box(
+    Box(
         modifier = finalModifier
     )
 }

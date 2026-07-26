@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	mathrand "math/rand"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -109,16 +110,7 @@ type captchaV2Session struct {
 	profile          Profile
 	savedProfile     *SavedProfile
 	variedDeviceJSON string
-}
-
-func solveVkCaptchaV2(
-	ctx context.Context,
-	captchaErr *VkCaptchaError,
-	client tlsclient.HttpClient,
-	profile Profile,
-	savedProfile *SavedProfile,
-) (string, error) {
-	return solveVkCaptchaV2Attempts(ctx, captchaErr, client, profile, savedProfile, captchaV2MaxAttempts)
+	domain           string
 }
 
 func solveVkCaptchaV2Attempts(
@@ -137,7 +129,13 @@ func solveVkCaptchaV2Attempts(
 	}
 	log.Printf("[КАПЧА] Решаю VK Smart Captcha автоматически (v2, попыток=%d)...", maxAttempts)
 
-	s := &captchaV2Session{ctx: ctx, client: client, profile: profile, savedProfile: savedProfile}
+	s := &captchaV2Session{
+		ctx:          ctx,
+		client:       client,
+		profile:      profile,
+		savedProfile: savedProfile,
+		domain:       captchaDomainFromRedirectURI(captchaErr.RedirectURI),
+	}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		rotateCaptchaV2Identity(s, savedProfile)
@@ -198,7 +196,7 @@ func (s *captchaV2Session) solveOnce(captchaErr *VkCaptchaError) (string, error)
 	}
 	log.Printf("[КАПЧА] v2 pow solved")
 
-	base := captchaV2BaseValues(captchaErr.SessionToken)
+	base := captchaV2BaseValues(captchaErr.SessionToken, s.domain)
 	if _, settingsErr := s.captchaRequest("captchaNotRobot.settings", base); settingsErr != nil {
 		return "", fmt.Errorf("captcha settings failed: %w", settingsErr)
 	}
@@ -262,13 +260,26 @@ func (s *captchaV2Session) solveOnce(captchaErr *VkCaptchaError) (string, error)
 	return token, nil
 }
 
-func captchaV2BaseValues(sessionToken string) [][2]string {
+func captchaV2BaseValues(sessionToken, domain string) [][2]string {
 	return [][2]string{
 		{"session_token", sessionToken},
-		{"domain", "vk.com"},
+		{"domain", domain},
 		{"adFp", ""},
 		{"access_token", ""},
 	}
+}
+
+func captchaDomainFromRedirectURI(redirectURI string) string {
+	const fallback = "vk.com"
+	parsed, err := url.Parse(redirectURI)
+	if err != nil {
+		return fallback
+	}
+	domain := strings.TrimSpace(parsed.Query().Get("domain"))
+	if domain == "" {
+		return fallback
+	}
+	return domain
 }
 
 func isCaptchaSessionDead(err error) bool {
@@ -501,7 +512,7 @@ func (s *captchaV2Session) performCaptchaCheck(
 ) (*captchaV2Check, error) {
 	values := [][2]string{
 		{"session_token", sessionToken},
-		{"domain", "vk.com"},
+		{"domain", s.domain},
 		{"adFp", ""},
 		{"accelerometer", "[]"},
 		{"gyroscope", "[]"},
@@ -557,7 +568,7 @@ func (s *captchaV2Session) solveCheckboxCaptcha(
 	deviceJSON := s.deviceJSON()
 	if _, err := s.captchaRequest("captchaNotRobot.componentDone", [][2]string{
 		{"session_token", sessionToken},
-		{"domain", "vk.com"},
+		{"domain", s.domain},
 		{"adFp", ""},
 		{"browser_fp", browserFP},
 		{"device", deviceJSON},

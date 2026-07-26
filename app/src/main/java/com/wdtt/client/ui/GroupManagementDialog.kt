@@ -77,7 +77,7 @@ fun GroupManagementDialog(
                                 }
                                 Row {
                                     IconButton(onClick = { onExportGroup(group) }, modifier = Modifier.size(36.dp)) {
-                                        Icon(androidx.compose.material.icons.Icons.Default.Share, contentDescription = "Экспорт", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
+                                        Icon(Icons.Default.Share, contentDescription = "Экспорт", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
                                     }
                                     if (!isSubscription) {
                                         IconButton(onClick = { editGroup = group }, modifier = Modifier.size(36.dp)) {
