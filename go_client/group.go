@@ -12,10 +12,7 @@ import (
 )
 
 
-const (
-	workersPerGroup  = 9
-	defaultCycleSecs = 36000
-)
+const workersPerGroup = 9
 
 // WorkerGroup:
 // Запускает 9 потоков с одними кредами. Ротации нет — работает до смерти воркеров.
@@ -191,7 +188,9 @@ func WorkerGroup(
 						strings.Contains(errStrLower, "allocation mismatch") ||
 						strings.Contains(errStrLower, "error 508"))
 
-					if strings.Contains(errStrLower, "rate limit") ||
+					if hint := workerErrorHint(sessErr); hint != "" {
+						errStr += " | " + hint
+					} else if strings.Contains(errStrLower, "rate limit") ||
 						strings.Contains(errStrLower, "flood control") ||
 						strings.Contains(errStrLower, "ip mismatch") ||
 						strings.Contains(errStrLower, "error 29") {

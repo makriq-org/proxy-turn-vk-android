@@ -145,12 +145,7 @@ class ProfilesStore(context: Context) {
                     lastSyncAt = prefs[subLastSyncKey(id)] ?: 0L,
                     lastSyncError = prefs[subLastErrorKey(id)] ?: ""
                 )
-            }
         }
-
-    suspend fun sumTrafficInGroup(groupId: String): Double {
-        if (groupId.isBlank()) return 0.0
-        return profiles.first().filter { it.groupId == groupId }.sumOf { it.trafficMb }
     }
 
     suspend fun saveSubscription(sub: ProfileSubscription) = withContext(Dispatchers.IO) {
@@ -271,14 +266,6 @@ class ProfilesStore(context: Context) {
         val failed: Int,
         val skippedFresh: Int,
     )
-
-    suspend fun refreshAllSubscriptions(): Int = withContext(Dispatchers.IO) {
-        var ok = 0
-        subscriptions.first().forEach { sub ->
-            if (refreshSubscription(sub.id).isSuccess) ok++
-        }
-        ok
-    }
 
     /**
      * Тихое автообновление: только «устаревшие» по интервалу, либо все при [SettingsStore.SUB_AUTO_REFRESH_EVERY_OPEN].
@@ -465,12 +452,6 @@ class ProfilesStore(context: Context) {
             val key = trafficKey(id)
             val current = prefs[key] ?: 0.0
             prefs[key] = current + additionalTrafficMb
-        }
-    }
-
-    suspend fun resetProfileTraffic(id: String) = withContext(Dispatchers.IO) {
-        dataStore.edit { prefs ->
-            prefs[trafficKey(id)] = 0.0
         }
     }
 

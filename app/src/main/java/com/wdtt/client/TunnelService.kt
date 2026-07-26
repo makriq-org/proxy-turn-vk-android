@@ -86,6 +86,14 @@ class TunnelService : Service() {
                             intent.getStringExtra("obfs_mode")?.takeIf { it.isNotEmpty() }
                                 ?: store.obfsMode.first()
                         )
+                        val connectionMode = SettingsStore.normalizeConnectionMode(
+                            intent.getStringExtra("connection_mode")?.takeIf { it.isNotEmpty() }
+                                ?: store.connectionMode.first()
+                        )
+                        val socksPort = SettingsStore.normalizeSocksPort(
+                            intent.getIntExtra("socks_port", 0).takeIf { it > 0 }
+                                ?: store.socksPort.first()
+                        )
                         
                         val params = TunnelParams(
                             peer = peerWithPort,
@@ -102,6 +110,8 @@ class TunnelService : Service() {
                             vkAnonPath = vkAnonPath,
                             goDnsArg = goDnsArg,
                             obfsMode = obfsMode,
+                            connectionMode = connectionMode,
+                            socksPort = socksPort,
                             detailedLogs = store.detailedLogs.first()
                         )
                         launch(Dispatchers.Main) {
@@ -121,8 +131,8 @@ class TunnelService : Service() {
                 acquireWakeLock()
             }
             "DEPLOY_CANCEL" -> {
-                com.wdtt.client.DeployManager.writeError("[!] ❌ Установка отменена пользователем")
-                com.wdtt.client.DeployManager.stopDeploy("error: Отменена пользователем")
+                DeployManager.writeError("[!] ❌ Установка отменена пользователем")
+                DeployManager.stopDeploy("error: Отменена пользователем")
                 stopForeground(STOP_FOREGROUND_REMOVE)
             }
             "DEPLOY_STOP" -> {
@@ -163,6 +173,8 @@ class TunnelService : Service() {
                     vkAnonPath = SettingsStore.normalizeVkAnonPath(store.vkAnonPath.first()),
                     goDnsArg = store.resolveGoDnsArg(),
                     obfsMode = SettingsStore.normalizeObfsMode(store.obfsMode.first()),
+                    connectionMode = SettingsStore.normalizeConnectionMode(store.connectionMode.first()),
+                    socksPort = SettingsStore.normalizeSocksPort(store.socksPort.first()),
                     detailedLogs = store.detailedLogs.first()
                 )
                 if (params.peer.isNotEmpty() && params.vkHashes.isNotEmpty()) {
@@ -185,7 +197,9 @@ class TunnelService : Service() {
     }
 
     private fun startTunnel(params: TunnelParams, forceStart: Boolean = false) {
-        wasOnWifi = isUnderlyingWifiActive()
+        // Учитываем и невалидированный Wi‑Fi: иначе через секунду VALIDATED
+        // выглядит как «переход на Wi‑Fi» и стоп по опции убивает ручной старт.
+        wasOnWifi = isUnderlyingWifiActive() || isUnderlyingWifiPresent()
         updateNotification("Подключение...")
         acquireWakeLock()
         acquireWifiLock()
@@ -216,7 +230,7 @@ class TunnelService : Service() {
     }
 
     private fun setupNetworkCallback() {
-        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
         activeNetworks.clear()
         
         networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -296,6 +310,16 @@ class TunnelService : Service() {
         }
     }
 
+    /** Wi‑Fi уже всплыл, но ещё может быть без VALIDATED (момент перед стопом). */
+    private fun isUnderlyingWifiPresent(): Boolean {
+        val cm = connectivityManager ?: return false
+        return activeNetworks.any { network ->
+            val caps = cm.getNetworkCapabilities(network) ?: return@any false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        }
+    }
+
     private fun networkCapabilityFingerprint(caps: NetworkCapabilities): String {
         val transports = buildList {
             if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) add("wifi")
@@ -335,31 +359,32 @@ class TunnelService : Service() {
     }
     
     private fun handleNetworkChange() {
-        val now = System.currentTimeMillis()
-        if (now - lastNetworkChangeTime < 3000) return
-        lastNetworkChangeTime = now
-
         val nowOnWifi = isUnderlyingWifiActive()
+        val wifiPresent = isUnderlyingWifiPresent()
         val transitionedToWifi = nowOnWifi && !wasOnWifi
         wasOnWifi = nowOnWifi
 
-        // Только переход «не Wi‑Fi → валидированный Wi‑Fi».
-        // Старт уже на Wi‑Fi не гасим — иначе нельзя пользоваться VPN дома.
-        if (transitionedToWifi && TunnelManager.running.value && !isTunnelPaused) {
-            TunnelManager.scope.launch {
-                val stopOnWifi = SettingsStore(applicationContext).stopOnWifi.first()
-                if (stopOnWifi) {
-                    Log.d("TunnelService", "Подключились к Wi-Fi — отключаем туннель по настройке")
-                    TunnelManager.addNetworkLog("[СЕТЬ] Wi‑Fi: туннель отключён (опция «Отключать на Wi‑Fi»)")
-                    launch(Dispatchers.Main) { stopTunnel() }
-                    return@launch
-                }
-                restartTransportIfRunning()
+        TunnelManager.scope.launch {
+            val stopOnWifi = SettingsStore(applicationContext).stopOnWifi.first()
+            // Только переход на Wi‑Fi гасит туннель. Ручной старт уже на Wi‑Fi — ок.
+            if (stopOnWifi && transitionedToWifi && TunnelManager.running.value && !isTunnelPaused) {
+                Log.d("TunnelService", "Подключились к Wi‑Fi — отключаем туннель по настройке")
+                TunnelManager.addNetworkLog("[СЕТЬ] Wi‑Fi: туннель отключён (опция «Отключать на Wi‑Fi»)")
+                launch(Dispatchers.Main) { stopTunnel() }
+                return@launch
             }
-            return
-        }
+            // Wi‑Fi поднимается (ещё без VALIDATED) при включённой опции — не реконнектимся,
+            // иначе «Переподключение» съедает стоп debounce'ом на validated.
+            if (stopOnWifi && !nowOnWifi && wifiPresent && TunnelManager.running.value && !isTunnelPaused) {
+                Log.d("TunnelService", "Wi‑Fi поднимается — ждём VALIDATED, без переподключения")
+                return@launch
+            }
 
-        restartTransportIfRunning()
+            val now = System.currentTimeMillis()
+            if (now - lastNetworkChangeTime < 3000) return@launch
+            lastNetworkChangeTime = now
+            restartTransportIfRunning()
+        }
     }
 
     private fun restartTransportIfRunning() {
@@ -444,11 +469,23 @@ class TunnelService : Service() {
             try {
                 while (isActive) {
                     if (!TunnelManager.running.value && !isTunnelPaused) {
+                        if (TunnelManager.isReconnecting.value || TunnelManager.transportRestartInProgress) {
+                            delay(2000)
+                            continue
+                        }
+                        // Старт ещё идёт (вход по аккаунту VK, DNS, капча…) — FGS нельзя убивать,
+                        // иначе Android снимает уведомление и усыпляет приложение.
+                        if (TunnelManager.isConnecting.value) {
+                            val connectingText = TunnelManager.stats.value.trim().ifEmpty { "Подключение..." }
+                            updateNotification(connectingText)
+                            delay(2000)
+                            continue
+                        }
                         // Туннель полностью остановлен (не на паузе) — убиваем сервис
                         stopSelf()
                         break
                     }
-                    if (TunnelManager.running.value && !isTunnelPaused) {
+                    if (TunnelManager.running.value && !isTunnelPaused && !TunnelManager.isSocksModeActive()) {
                         val helper = WireGuardHelper(applicationContext)
                         when (helper.watchdogState()) {
                             WireGuardHelper.WatchdogState.UP -> wasEverUp = true
@@ -482,6 +519,15 @@ class TunnelService : Service() {
     }
 
     private fun buildTunnelNotificationText(): String {
+        val socks = TunnelManager.activeSocksListenAddress()
+        if (socks != null) {
+            val statsText = TunnelManager.stats.value.trim()
+            return when {
+                statsText.isEmpty() || statsText == "Ожидание данных..." || statsText.startsWith("SOCKS") ->
+                    "SOCKS $socks"
+                else -> "$statsText · $socks"
+            }
+        }
         val statsText = TunnelManager.stats.value.trim()
         return when {
             statsText.isEmpty() -> "Туннель активен"

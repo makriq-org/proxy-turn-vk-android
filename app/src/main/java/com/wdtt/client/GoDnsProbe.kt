@@ -109,8 +109,7 @@ object GoDnsProbe {
         dohCustomRaw: String = "",
         timeoutMs: Int = 2000,
     ): Result {
-        val normalized = SettingsStore.normalizeGoDnsPreset(preset)
-        val arg = when (normalized) {
+        val arg = when (val normalized = SettingsStore.normalizeGoDnsPreset(preset)) {
             "custom" -> {
                 val servers = SettingsStore.normalizeGoDnsServers(customRaw)
                 if (servers.isNotEmpty()) "custom:$servers" else "yandex"

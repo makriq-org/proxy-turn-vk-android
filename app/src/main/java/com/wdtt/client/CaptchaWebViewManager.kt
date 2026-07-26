@@ -9,8 +9,6 @@ import android.util.Log
 import android.view.MotionEvent
 import android.view.View
 import android.webkit.JavascriptInterface
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -210,9 +208,9 @@ object CaptchaWebViewManager {
     @SuppressLint("SetJavaScriptEnabled")
     private fun createWebViewSync(context: Context, onStep: (String) -> Unit): WebView? {
         // Рандомизируем параметры для КАЖДОГО запроса
-        val vw = VIEWPORT_WIDTHS[Random.Default.nextInt(VIEWPORT_WIDTHS.size)]
-        val vh = VIEWPORT_HEIGHTS[Random.Default.nextInt(VIEWPORT_HEIGHTS.size)]
-        val chromeBuild = CHROME_BUILDS[Random.Default.nextInt(CHROME_BUILDS.size)]
+        val vw = VIEWPORT_WIDTHS[Random.nextInt(VIEWPORT_WIDTHS.size)]
+        val vh = VIEWPORT_HEIGHTS[Random.nextInt(VIEWPORT_HEIGHTS.size)]
+        val chromeBuild = CHROME_BUILDS[Random.nextInt(CHROME_BUILDS.size)]
         val ua = VkCaptchaWebViewUa.randomDesktop()
 
         Log.d(TAG, "Fingerprint: ${vw}x${vh}, Chrome/$chromeBuild")
@@ -261,7 +259,7 @@ object CaptchaWebViewManager {
 
                                 if (currentWebView === view && isTunnelActive) {
                                     // Быстрый auto-pass: WebView получает такой же короткий темп, как Go v2.
-                                    val pageLoadDelay = 650L + Random.Default.nextLong(0, 550)
+                                    val pageLoadDelay = 650L + Random.nextLong(0, 550)
                                     mainHandler.postDelayed({
                                         if (currentWebView === view && isTunnelActive) {
                                             solveCaptchaAutomatedSync(view)
@@ -271,26 +269,6 @@ object CaptchaWebViewManager {
                             }
                         }
 
-                        override fun shouldInterceptRequest(
-                            view: WebView, request: WebResourceRequest
-                        ): WebResourceResponse? {
-                            return super.shouldInterceptRequest(view, request)
-                        }
-
-                        override fun onReceivedSslError(
-                            view: WebView,
-                            handler: android.webkit.SslErrorHandler,
-                            error: android.net.http.SslError
-                        ) {
-                            // Разрешаем только для доверенных доменов VK/OK
-                            val url = error.url ?: ""
-                            if (url.contains("vk.ru") || url.contains("vk.com") || url.contains("okcdn.ru")) {
-                                handler.proceed()
-                            } else {
-                                handler.cancel()
-                                Log.w(TAG, "SSL error rejected for: $url")
-                            }
-                        }
                     }
 
                     webChromeClient = WebChromeClient()
@@ -443,12 +421,12 @@ object CaptchaWebViewManager {
 
             // Рандомная точка внутри label (60-90% ширины, 25-75% высоты)
             // Человек кликает не ровно в центр, а примерно туда
-            val randX = left + width * (0.15f + Random.Default.nextFloat() * 0.7f)
-            val randY = top + height * (0.25f + Random.Default.nextFloat() * 0.5f)
+            val randX = left + width * (0.15f + Random.nextFloat() * 0.7f)
+            val randY = top + height * (0.25f + Random.nextFloat() * 0.5f)
 
             Log.d(TAG, "Клик: (${randX.toInt()}, ${randY.toInt()}) в зоне ${width.toInt()}x${height.toInt()}")
 
-            val thinkDelay = 420L + Random.Default.nextLong(0, 260)
+            val thinkDelay = 420L + Random.nextLong(0, 260)
 
             mainHandler.postDelayed({
                 if (currentWebView === webView && isTunnelActive) {
@@ -530,7 +508,7 @@ object CaptchaWebViewManager {
         val downTime = SystemClock.uptimeMillis()
 
         // Рандомный pressure — палец нажимает с разной силой
-        val pressure = 0.5f + Random.Default.nextFloat() * 0.4f
+        val pressure = 0.5f + Random.nextFloat() * 0.4f
 
         val downEvent = MotionEvent.obtain(
             downTime, downTime, MotionEvent.ACTION_DOWN, physX, physY, pressure, 1f, 0, 1f, 1f, 0, 0
@@ -540,13 +518,13 @@ object CaptchaWebViewManager {
         downEvent.recycle()
 
         // Удержание пальца: 80-180мс
-        val holdTime = 80L + Random.Default.nextLong(0, 100)
+        val holdTime = 80L + Random.nextLong(0, 100)
 
         mainHandler.postDelayed({
             if (currentWebView === webView) {
                 // Лёгкое смещение при отпускании (палец не стоит идеально на месте)
-                val jitterX = physX + (-1f + Random.Default.nextFloat() * 2f) * density
-                val jitterY = physY + (-0.5f + Random.Default.nextFloat() * 1f) * density
+                val jitterX = physX + (-1f + Random.nextFloat() * 2f) * density
+                val jitterY = physY + (-0.5f + Random.nextFloat() * 1f) * density
 
                 val upEvent = MotionEvent.obtain(
                     downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP,

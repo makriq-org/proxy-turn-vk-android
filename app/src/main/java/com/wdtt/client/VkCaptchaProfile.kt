@@ -1,7 +1,6 @@
 package com.wdtt.client
 
 import android.content.Context
-import android.util.DisplayMetrics
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -67,10 +66,6 @@ object VkCaptchaProfile {
         }
 
         File(appContext.filesDir, PROFILE_FILE).writeText(profile.toString())
-    }
-
-    fun rotateBrowserFp(context: Context) {
-        writeForGo(context.applicationContext)
     }
 
     private fun jitter(base: Int, delta: Int): Int {

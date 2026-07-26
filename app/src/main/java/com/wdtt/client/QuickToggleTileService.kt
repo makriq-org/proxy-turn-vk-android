@@ -1,11 +1,19 @@
 package com.wdtt.client
 
+import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.VpnService
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
+import android.util.Log
+import android.widget.Toast
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class QuickToggleTileService : TileService() {
 
@@ -16,9 +24,34 @@ class QuickToggleTileService : TileService() {
 
     override fun onClick() {
         super.onClick()
-        val willRun = !TunnelManager.running.value
-        TunnelControl.toggle(applicationContext)
-        updateTile(willRun)
+        runCatching {
+            if (TunnelManager.running.value) {
+                TunnelControl.stop(applicationContext)
+                updateTile(false)
+                return
+            }
+
+            TunnelManager.scope.launch {
+                val mode = SettingsStore(applicationContext).connectionMode.first()
+                val needsVpn = mode != SettingsStore.CONNECTION_MODE_SOCKS &&
+                    VpnService.prepare(this@QuickToggleTileService) != null
+                withContext(Dispatchers.Main) {
+                    if (needsVpn) {
+                        Toast.makeText(
+                            this@QuickToggleTileService,
+                            "Разрешите qWDTT создать VPN-подключение",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        openVpnPermissionActivity()
+                    } else {
+                        TunnelControl.startFromSavedSettings(applicationContext)
+                        updateTile(true)
+                    }
+                }
+            }
+        }.onFailure { e ->
+            Log.e(TAG, "QS tile onClick failed", e)
+        }
     }
 
     private fun updateTileState() {
@@ -43,16 +76,42 @@ class QuickToggleTileService : TileService() {
         tile.updateTile()
     }
 
+    private fun openVpnPermissionActivity() {
+        openActivity(Intent(this, VpnPermissionActivity::class.java), 101)
+    }
+
+    private fun openActivity(intent: Intent, requestCode: Int) {
+        runCatching {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (Build.VERSION.SDK_INT >= 34) {
+                val pendingIntent = PendingIntent.getActivity(
+                    this,
+                    requestCode,
+                    intent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                )
+                startActivityAndCollapse(pendingIntent)
+            } else {
+                @Suppress("DEPRECATION")
+                startActivityAndCollapse(intent)
+            }
+        }.onFailure { e ->
+            Log.e(TAG, "Failed to open activity", e)
+        }
+    }
+
     companion object {
+        private const val TAG = "QuickToggleTile"
+
         fun requestTileUpdate(context: Context) {
             if (Build.VERSION.SDK_INT >= 24) {
                 try {
-                    TileService.requestListeningState(
+                    requestListeningState(
                         context,
-                        ComponentName(context, QuickToggleTileService::class.java)
+                        ComponentName(context, QuickToggleTileService::class.java),
                     )
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    Log.w(TAG, "requestListeningState failed", e)
                 }
             }
         }

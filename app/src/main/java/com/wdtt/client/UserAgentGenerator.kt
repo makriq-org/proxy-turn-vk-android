@@ -66,12 +66,4 @@ object UserAgentGenerator {
         }
     }
 
-    /**
-     * Генерирует детерминированный UA на основе device ID.
-     * Один и тот же device ID всегда даёт одинаковый UA.
-     */
-    fun generateForDevice(deviceId: String): String {
-        val seed = deviceId.hashCode().toLong() and 0xFFFFFFFFL
-        return generate(seed)
-    }
 }

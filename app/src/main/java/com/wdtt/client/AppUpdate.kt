@@ -30,6 +30,7 @@ private const val GITHUB_RELEASES_URL = "https://api.github.com/repos/$GITHUB_RE
 private const val GITHUB_LATEST_RELEASE_URL = "https://api.github.com/repos/$GITHUB_REPO_PATH/releases/latest"
 private const val GITHUB_LATEST_RELEASE_WEB_URL = "https://github.com/$GITHUB_REPO_PATH/releases/latest"
 private const val GITHUB_RELEASE_TAG_URL_PREFIX = "https://github.com/$GITHUB_REPO_PATH/releases/tag/"
+private const val GITHUB_RELEASE_BY_TAG_URL_PREFIX = "https://api.github.com/repos/$GITHUB_REPO_PATH/releases/tags/"
 private const val GITHUB_TAGS_URL = "https://api.github.com/repos/$GITHUB_REPO_PATH/tags?per_page=100"
 private const val GITHUB_TAG_TREE_URL_PREFIX = "https://github.com/$GITHUB_REPO_PATH/tree/"
 private const val GITHUB_API_RATE_LIMIT_FALLBACK_MS = 30L * 60L * 1000L
@@ -52,14 +53,6 @@ data class AppReleaseInfo(
     val isPrerelease: Boolean = false,
 )
 
-data class ReleaseChangelogItem(
-    val versionTag: String,
-    val publishedAt: String,
-    val body: String,
-    val isPrerelease: Boolean,
-    val releaseUrl: String,
-)
-
 enum class RemoteVersionSource {
     Release,
     Tag
@@ -69,9 +62,19 @@ suspend fun fetchLatestReleaseInfo(
     localVersion: String? = null,
     includePrerelease: Boolean = false,
 ): AppReleaseInfo? = withContext(Dispatchers.IO) {
-    val latestRelease = fetchReleaseFromLatestWebRedirect(includePrerelease)
-        ?: fetchReleaseFromLatestEndpoint(includePrerelease)
+    // Сначала API — там есть assets/.apk. Веб-редирект раньше брался первым и
+    // возвращал версию без downloadUrl → в UI всегда «В браузере».
+    var latestRelease = fetchReleaseFromLatestEndpoint(includePrerelease)
         ?: fetchLatestReleaseFromList(includePrerelease)
+        ?: fetchReleaseFromLatestWebRedirect(includePrerelease)
+
+    if (latestRelease != null &&
+        latestRelease.source == RemoteVersionSource.Release &&
+        latestRelease.downloadUrl.isNullOrBlank()
+    ) {
+        latestRelease = enrichReleaseWithAssets(latestRelease) ?: latestRelease
+    }
+
     val latestTag = if (includePrerelease) null else fetchLatestTagFromList()
 
     when {
@@ -79,68 +82,6 @@ suspend fun fetchLatestReleaseInfo(
         latestTag == null -> latestRelease
         isNewerVersion(latestRelease.versionTag, latestTag.versionTag, includePrerelease) -> latestTag
         else -> latestRelease
-    }
-}
-
-suspend fun fetchReleaseChangelog(
-    includePrerelease: Boolean = false,
-    limit: Int = 12,
-): List<ReleaseChangelogItem> = withContext(Dispatchers.IO) {
-    val response = fetchGitHubApi(GITHUB_RELEASES_URL) ?: return@withContext emptyList()
-    val releases = try {
-        JSONArray(response)
-    } catch (e: Exception) {
-        Log.w(UPDATE_LOG_TAG, "[WARN] Changelog: failed to parse releases list", e)
-        return@withContext emptyList()
-    }
-
-    val items = mutableListOf<ReleaseChangelogItem>()
-    for (i in 0 until releases.length()) {
-        val json = releases.optJSONObject(i) ?: continue
-        if (json.optBoolean("draft")) continue
-        if (!includePrerelease && json.optBoolean("prerelease")) continue
-        val versionTag = normalizeVersionTag(json.optString("tag_name"))
-        val releaseUrl = json.optString("html_url").trim()
-        if (versionTag.isBlank() || releaseUrl.isBlank()) continue
-        items += ReleaseChangelogItem(
-            versionTag = versionTag,
-            publishedAt = json.optString("published_at").substringBefore("T"),
-            body = json.optString("body").trim(),
-            isPrerelease = json.optBoolean("prerelease"),
-            releaseUrl = releaseUrl,
-        )
-    }
-    items.take(limit)
-}
-
-suspend fun fetchReleaseNotesForVersion(versionTag: String): String = withContext(Dispatchers.IO) {
-    val normalized = normalizeVersionTag(versionTag)
-    val response = fetchGitHubApi(GITHUB_RELEASES_URL) ?: return@withContext bundledReleaseNotes(versionTag)
-    val releases = try {
-        JSONArray(response)
-    } catch (_: Exception) {
-        return@withContext bundledReleaseNotes(versionTag)
-    }
-    for (i in 0 until releases.length()) {
-        val json = releases.optJSONObject(i) ?: continue
-        if (normalizeVersionTag(json.optString("tag_name")) == normalized) {
-            return@withContext json.optString("body").trim().ifBlank { bundledReleaseNotes(versionTag) }
-        }
-    }
-    bundledReleaseNotes(versionTag)
-}
-
-fun bundledReleaseNotes(versionTag: String): String {
-    return when (normalizeVersionTag(versionTag)) {
-        "1.3.2" -> """
-            • SSH-ключ для деплоя на VPS
-            • Упрощён ввод IP — порт только в «Секретах»
-            • Кнопка «Подключить» сразу на экране туннеля
-            • Сторонний VPN не отключается при простом открытии приложения
-            • Опция «Отключать на Wi-Fi»
-            • Автогенерация VK-хешей при входе в аккаунт
-        """.trimIndent()
-        else -> ""
     }
 }
 
@@ -372,23 +313,46 @@ private fun noteGitHubApiCooldown(conn: HttpURLConnection, responseCode: Int, re
     }
 }
 
+private fun enrichReleaseWithAssets(info: AppReleaseInfo): AppReleaseInfo? {
+    val tag = normalizeVersionTag(info.versionTag).ifBlank { return null }
+    val response = fetchGitHubApi("$GITHUB_RELEASE_BY_TAG_URL_PREFIX$tag")
+        ?: fetchGitHubApi("$GITHUB_RELEASE_BY_TAG_URL_PREFIX${tag.removePrefix("v")}")
+        ?: return null
+    val json = try {
+        JSONObject(response)
+    } catch (e: Exception) {
+        Log.w(UPDATE_LOG_TAG, "[WARN] Update check: failed to enrich release assets for $tag", e)
+        return null
+    }
+    return json.toAppReleaseInfo()?.copy(
+        releaseUrl = info.releaseUrl.ifBlank { json.optString("html_url").trim() }
+    )
+}
+
+private fun pickApkAssetUrl(assets: JSONArray): String? {
+    data class ApkAsset(val name: String, val url: String)
+    val apks = mutableListOf<ApkAsset>()
+    for (i in 0 until assets.length()) {
+        val asset = assets.optJSONObject(i) ?: continue
+        val name = asset.optString("name")
+        val url = asset.optString("browser_download_url").trim()
+        if (!name.endsWith(".apk", ignoreCase = true) || url.isBlank()) continue
+        apks += ApkAsset(name, url)
+    }
+    if (apks.isEmpty()) return null
+    return apks.firstOrNull { it.name.contains("universal", ignoreCase = true) }?.url
+        ?: apks.firstOrNull { it.name.contains("arm64", ignoreCase = true) }?.url
+        ?: apks.first().url
+}
+
 private fun JSONObject.toAppReleaseInfo(): AppReleaseInfo? {
     val versionTag = normalizeVersionTag(optString("tag_name"))
     val releaseUrl = optString("html_url").trim()
     if (versionTag.isBlank() || releaseUrl.isBlank()) return null
-    
-    var downloadUrl: String? = null
+
     val assets = optJSONArray("assets")
-    if (assets != null) {
-        for (i in 0 until assets.length()) {
-            val asset = assets.optJSONObject(i) ?: continue
-            if (asset.optString("name").endsWith(".apk", ignoreCase = true)) {
-                downloadUrl = asset.optString("browser_download_url")
-                break
-            }
-        }
-    }
-    
+    val downloadUrl = if (assets != null) pickApkAssetUrl(assets) else null
+
     return AppReleaseInfo(
         versionTag,
         releaseUrl,
@@ -397,11 +361,6 @@ private fun JSONObject.toAppReleaseInfo(): AppReleaseInfo? {
         releaseNotes = optString("body").trim(),
         isPrerelease = optBoolean("prerelease"),
     )
-}
-
-private fun versionParts(version: String): List<Int> {
-    val normalized = VERSION_NUMBER_REGEX.find(version.trim())?.value ?: return emptyList()
-    return normalized.split(".").mapNotNull { it.toIntOrNull() }
 }
 
 private fun normalizeVersionTag(version: String): String {

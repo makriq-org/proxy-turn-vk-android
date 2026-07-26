@@ -202,19 +202,6 @@ object HashCheckHelper {
         }
     }
 
-    fun statusLabel(status: String): String = when (status) {
-        "ok" -> "живой"
-        "dead" -> "закрыт"
-        "captcha" -> "капча"
-        "limited" -> "лимит"
-        "network" -> "сеть"
-        "checking" -> "проверка"
-        "solving_captcha" -> "капча…"
-        "pending" -> "очередь"
-        "cancelled" -> "стоп"
-        else -> "ошибка"
-    }
-
     private fun defaultMessage(status: String): String = when (status) {
         "ok" -> "TURN доступен"
         "dead" -> "Звонок закрыт или хеш недействителен"

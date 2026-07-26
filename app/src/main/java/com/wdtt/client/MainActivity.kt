@@ -17,13 +17,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -38,14 +34,12 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
-import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.FilterList
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.FolderOpen
-import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.VpnKey
 import androidx.compose.material3.*
@@ -72,12 +66,10 @@ import androidx.compose.ui.platform.LocalContext
 import com.wdtt.client.ui.AppUpdateDialog
 import com.wdtt.client.ui.SupportNoticeDialog
 import com.wdtt.client.ui.ProfilesTab
-import com.wdtt.client.ui.FloatingToolbar
 import com.wdtt.client.ui.LogsTab
 import com.wdtt.client.ui.SettingsTab
 import com.wdtt.client.ui.DeployTab
 import com.wdtt.client.ui.ExceptionsTab
-import com.wdtt.client.ui.InfoTab
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.first
@@ -138,7 +130,7 @@ class MainActivity : ComponentActivity() {
         var currentActivity: MainActivity? = null
 
         // URI файла .qwdtt, ожидающего импорта
-        val pendingFileUri = mutableStateOf<android.net.Uri?>(null)
+        val pendingFileUri = mutableStateOf<Uri?>(null)
 
         // Открыть экран создания профиля из ярлыка лаунчера
         val pendingAddProfile = mutableStateOf(false)
@@ -243,7 +235,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkAndRequestBattery() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
         if (!pm.isIgnoringBatteryOptimizations(packageName)) {
             try {
                 val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
@@ -535,7 +527,8 @@ fun MainScreen(
                             onDynamicColorChange = onDynamicColorChange,
                             currentPalette = currentPalette,
                             onPaletteChange = onPaletteChange,
-                            onConnectRequested = { pendingSwitchToLogs = true }
+                            onConnectRequested = { pendingSwitchToLogs = true },
+                            onOpenProfiles = { selectedTab = 2 },
                         )
                         1 -> DeployTab()
                         2 -> ProfilesTab(
