@@ -190,6 +190,14 @@ qwdtt://config?name=Дом&peer=1.2.3.4:56000&hashes=хеш1,хеш2&workers=18&
 
 `server.go` → бинарь `wdtt-server`: DTLS, WRAP/RTP, выдача WG-конфига, `/etc/wdtt/passwords.json`, Telegram-бот.
 
+Готовый public-образ для `linux/amd64` публикуется в GHCR при изменении серверной части:
+
+```bash
+docker pull ghcr.io/makriq-org/wdtt-server:prod
+```
+
+Каждая сборка также получает неизменяемую метку `sha-<commit>`.
+
 | Параметр | Значение |
 |----------|----------|
 | `56000/udp` | DTLS (клиенты) |
