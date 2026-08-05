@@ -193,7 +193,7 @@ qwdtt://config?name=Дом&peer=1.2.3.4:56000&hashes=хеш1,хеш2&workers=18&
 Готовый public-образ для `linux/amd64` публикуется в GHCR при изменении серверной части:
 
 ```bash
-docker pull ghcr.io/makriq-org/wdtt-server:prod
+docker pull ghcr.io/makriq-org/proxy-turn-vk-android/wdtt-server:prod
 ```
 
 Каждая сборка также получает неизменяемую метку `sha-<commit>`.
