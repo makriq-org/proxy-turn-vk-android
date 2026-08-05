@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE_NAME: ghcr.io/makriq-org/wdtt-server
+  IMAGE_NAME: ghcr.io/makriq-org/proxy-turn-vk-android/wdtt-server
 
 jobs:
   publish:
