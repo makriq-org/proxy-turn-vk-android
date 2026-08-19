@@ -59,8 +59,16 @@ object TunnelManager {
     private var processStartedAtMs = 0L
     private var lastActiveAtMs = 0L
     private var lastStatsReceivedAtMs = 0L
+    @Volatile private var lastUplinkMb = 0.0
+    @Volatile private var lastDownlinkMb = 0.0
+    @Volatile private var lastUplinkChangedAtMs = 0L
+    @Volatile private var lastDownlinkChangedAtMs = 0L
     private var lastReconnectAtMs = 0L
     private val reconnectMutex = Mutex()
+    @Volatile private var keepWireGuardOnNextConfig = false
+    @Volatile private var preservedWireGuardConfig: String? = null
+    @Volatile
+    private var preserveVpnDuringReconnect = false
 
     private const val STALE_STATS_MS = 90_000L
     private const val HEALTH_CHECK_GRACE_MS = 120_000L
@@ -133,6 +141,7 @@ object TunnelManager {
     private const val PIPELINE_HIDE_AFTER_SUCCESS_MS = 4_000L
     /** Лимит на один шаг схемы (кроме Потоков и Капчи). */
     private const val PIPELINE_STEP_TIMEOUT_MS = 10_000L
+    private const val PIPELINE_RAW_STEP_TIMEOUT_MS = 25_000L
     /** Вход в несколько звонков через аккаунт VK может занять дольше. */
     private const val PIPELINE_VK_STEP_TIMEOUT_MS = 30_000L
     /** Инкремент → MainActivity / SettingsTab открывают диалог ⚙️ настроек. */
@@ -317,6 +326,9 @@ object TunnelManager {
             processStartedAtMs = 0L
             lastActiveAtMs = 0L
             lastStatsReceivedAtMs = 0L
+            resetTransportTrafficHealth()
+            keepWireGuardOnNextConfig = false
+            preservedWireGuardConfig = null
             activeHashIndex = 0
             lastContext = java.lang.ref.WeakReference(appContext)
             forceRegenerateUA = false
@@ -380,6 +392,16 @@ object TunnelManager {
                 if (params.connectionPassword.isBlank()) {
                     updateLog("password_error", "Ошибка: пароль подключения не указан", 99, true)
                     abortStart(isSwitching, "Пароль не указан")
+                    return@launch
+                }
+                if (
+                    SettingsStore.normalizeConnectionMode(params.connectionMode) == SettingsStore.CONNECTION_MODE_SOCKS &&
+                    params.socksAuthEnabled &&
+                    (params.socksUsername.isBlank() || params.socksPassword.isBlank() ||
+                        params.socksUsername.toByteArray().size > 255 || params.socksPassword.toByteArray().size > 255)
+                ) {
+                    updateLog("socks_auth_error", "Ошибка: заполните корректные логин и пароль SOCKS5", 99, true)
+                    abortStart(isSwitching, "Не заполнены данные авторизации SOCKS5")
                     return@launch
                 }
 
@@ -485,12 +507,33 @@ object TunnelManager {
                         val socks = params.socksListenAddress
                         cmd.add("-socks")
                         cmd.add(socks)
-                        updateLog("conn_mode", "[СЕТЬ] Режим: SOCKS5 ($socks), без VPN", 1, false)
+                        if (params.socksAuthEnabled) {
+                            cmd.add("-socks-auth")
+                            cmd.add("-socks-user")
+                            cmd.add(params.socksUsername)
+                            cmd.add("-socks-pass")
+                            cmd.add(params.socksPassword)
+                        }
+                        val authLabel = if (params.socksAuthEnabled) ", с авторизацией" else ""
+                        updateLog("conn_mode", "[СЕТЬ] Режим: SOCKS5 ($socks$authLabel), без VPN", 1, false)
                     }
                 }
 
                 setConnectionPipelineCurrent(ConnectionStep.DNS)
-                val dnsProbe = GoDnsProbe.check(params.goDnsArg)
+                var dnsProbe = GoDnsProbe.check(params.goDnsArg)
+                if (isSwitching && !dnsProbe.reachable) {
+                    for (attempt in 2..4) {
+                        updateLog(
+                            "go_dns_reconnect_wait",
+                            "[СЕТЬ] DNS ещё не готов после смены сети. Повторяем проверку ($attempt/4)...",
+                            50,
+                            false,
+                        )
+                        delay(2_000)
+                        dnsProbe = GoDnsProbe.check(params.goDnsArg)
+                        if (dnsProbe.reachable) break
+                    }
+                }
                 if (!dnsProbe.reachable) {
                     updateLog(
                         "go_dns_precheck_fail",
@@ -525,12 +568,6 @@ object TunnelManager {
                         updateLog("vk_auth_ok", "[VK Auth] TURN OK (${credsByHash.size})", 5, false)
                         advanceConnectionPipeline(ConnectionStep.VK, ConnectionStep.WRAP)
                     } catch (e: kotlinx.coroutines.CancellationException) {
-                        if (isSwitching) {
-                            handleReconnectFailed("Подключение отменено")
-                        } else {
-                            updateLog("start_cancelled", "Подключение отменено", 50, false)
-                            finishConnectingFailed()
-                        }
                         throw e
                     } catch (e: Exception) {
                         val msg = e.message ?: e::class.java.simpleName
@@ -559,7 +596,9 @@ object TunnelManager {
                 wrapAuthTimeoutCount = 0
                 lastActiveAtMs = 0L
                 lastStatsReceivedAtMs = System.currentTimeMillis()
-                transportRestartInProgress = false
+                if (!isSwitching) {
+                    transportRestartInProgress = false
+                }
                 isConnecting.value = false
                 markRunning(true)
                 stats.value = "Ожидание данных..."
@@ -567,16 +606,14 @@ object TunnelManager {
                 startWatchdog(appContext, params)
 
             } catch (e: kotlinx.coroutines.CancellationException) {
-                if (isSwitching) {
-                    handleReconnectFailed("Подключение отменено")
-                } else {
+                if (!isSwitching) {
                     updateLog("start_cancelled", "Подключение отменено", 50, false)
                     finishConnectingFailed()
                 }
                 throw e
             } catch (e: Exception) {
                 if (isSwitching) {
-                    handleReconnectFailed("Критическая ошибка: ${e.message}")
+                    handleSwitchingStartFailed("Критическая ошибка: ${e.message}")
                 } else {
                     updateLog("critical_start_error", "Критическая ошибка запуска: ${e.message}", 99, true)
                     e.printStackTrace()
@@ -589,7 +626,7 @@ object TunnelManager {
 
     private fun abortStart(isSwitching: Boolean, message: String) {
         if (isSwitching) {
-            handleReconnectFailed(message)
+            handleSwitchingStartFailed(message)
         } else {
             finishConnectingFailed()
         }
@@ -639,10 +676,23 @@ object TunnelManager {
         }
     }
 
+    private fun handleSwitchingStartFailed(reason: String) {
+        if (!preserveVpnDuringReconnect) {
+            handleReconnectFailed(reason)
+            return
+        }
+        transportRestartInProgress = false
+        isReconnecting.value = false
+        isConnecting.value = false
+        markRunning(true)
+        updateLog("soft_reconnect_fail", "⚠ Мягкое восстановление не удалось: $reason", 99, true)
+    }
+
     @SuppressLint("StaticFieldLeak")
     private fun startLogReader() {
         readerJob = scope.launch {
-            val reader = process?.inputStream?.bufferedReader() ?: return@launch
+            val observedProcess = process ?: return@launch
+            val reader = observedProcess.inputStream.bufferedReader()
             var collectingConfig = false
             val configBuilder = StringBuilder()
             var collectingRawConfig = false
@@ -830,6 +880,17 @@ object TunnelManager {
                                     lastSavedTrafficMb = currentTraffic
                                 }
                             }
+                        }
+
+                        val downlinkMb = Regex("↓\\s*([\\d.,]+)").find(msg)
+                            ?.groupValues?.getOrNull(1)?.replace(",", ".")?.toDoubleOrNull()
+                        val uplinkMb = Regex("↑\\s*([\\d.,]+)").find(msg)
+                            ?.groupValues?.getOrNull(1)?.replace(",", ".")?.toDoubleOrNull()
+                        if (downlinkMb != null && uplinkMb != null) {
+                            if (downlinkMb > lastDownlinkMb) lastDownlinkChangedAtMs = now
+                            if (uplinkMb > lastUplinkMb) lastUplinkChangedAtMs = now
+                            lastDownlinkMb = downlinkMb
+                            lastUplinkMb = uplinkMb
                         }
 
                         updateLog("stats", "[СТАТИСТИКА] $msg", 3, false)
@@ -1095,7 +1156,16 @@ object TunnelManager {
                             } else {
                                 scope.launch(Dispatchers.Main) {
                                     try {
-                                        wgHelper?.startTunnel(configStr)
+                                        val keepExisting = keepWireGuardOnNextConfig &&
+                                            preservedWireGuardConfig == configStr &&
+                                            wgHelper?.watchdogState() == WireGuardHelper.WatchdogState.UP
+                                        keepWireGuardOnNextConfig = false
+                                        preservedWireGuardConfig = null
+                                        if (!keepExisting) {
+                                            wgHelper?.startTunnel(configStr)
+                                        } else {
+                                            updateLog("network_wg_kept", "[VPN] WireGuard-интерфейс сохранён при перезапуске транспорта", 1, false)
+                                        }
                                         markConnectionPipelineCompleted(ConnectionStep.VPN)
                                         finishConnectionPipeline()
                                     } catch (e: Exception) {
@@ -1141,18 +1211,20 @@ object TunnelManager {
             } finally {
                 // Если процесс умер сам, ловим код выхода
                 try {
-                    val exitCode = process?.exitValue()
-                    if (exitCode != null && exitCode != 0 && !transportRestartInProgress) {
+                    val exitCode = observedProcess.exitValue()
+                    if (exitCode != 0 && !transportRestartInProgress) {
                         updateLog("sys_exit", "Процесс крашнулся с кодом $exitCode", 99, true)
                     }
                 } catch (_: IllegalThreadStateException) {
                     if (!transportRestartInProgress) {
-                        process?.destroy()
+                        observedProcess.destroy()
                     }
                 }
-                process = null
-                if (!transportRestartInProgress) {
-                    markRunning(false)
+                if (process === observedProcess) {
+                    process = null
+                    if (!transportRestartInProgress) {
+                        markRunning(false)
+                    }
                 }
             }
         }
@@ -1254,18 +1326,41 @@ object TunnelManager {
         }
     }
 
-    fun restartTransport() {
-        reconnectAll("смена сети")
+    fun restartTransport(reason: String = "смена сети", force: Boolean = false) {
+        reconnectAll(reason, force = force, preserveVpn = true)
     }
 
-    fun reconnectAll(reason: String) {
+    fun hasRecentTransportActivity(maxAgeMs: Long = 25_000L): Boolean {
+        val now = System.currentTimeMillis()
+        return running.value &&
+            activeWorkers.value > 0 &&
+            lastStatsReceivedAtMs > 0L &&
+            now - lastStatsReceivedAtMs <= maxAgeMs
+    }
+
+    fun hasDownlinkTrafficSince(sinceMs: Long): Boolean = lastDownlinkChangedAtMs >= sinceMs
+
+    fun hasHealthyRestartSince(sinceMs: Long, unansweredGraceMs: Long = 10_000L): Boolean {
+        val now = System.currentTimeMillis()
+        val transportReady = running.value &&
+            activeWorkers.value > 0 &&
+            lastActiveAtMs >= sinceMs &&
+            lastStatsReceivedAtMs >= sinceMs
+        if (!transportReady) return false
+        val unansweredTraffic = lastUplinkChangedAtMs >= sinceMs &&
+            lastDownlinkChangedAtMs < lastUplinkChangedAtMs &&
+            now - lastUplinkChangedAtMs >= unansweredGraceMs
+        return !unansweredTraffic
+    }
+
+    fun reconnectAll(reason: String, force: Boolean = false, preserveVpn: Boolean = false) {
         val params = currentParams ?: return
         val context = lastContext?.get() ?: return
 
         scope.launch {
             reconnectMutex.withLock {
                 val now = System.currentTimeMillis()
-                if (now - lastReconnectAtMs < MIN_RECONNECT_INTERVAL_MS) {
+                if (!force && now - lastReconnectAtMs < MIN_RECONNECT_INTERVAL_MS) {
                     updateLog("reconnect_skip", "Переподключение уже выполняется…", 50, false)
                     return@launch
                 }
@@ -1273,24 +1368,53 @@ object TunnelManager {
 
                 isReconnecting.value = true
                 transportRestartInProgress = true
+                preserveVpnDuringReconnect = preserveVpn
                 updateLog("reconnect", "🔄 Переподключение ($reason)...", 50, false)
                 try {
+                    val previousWireGuardConfig = config.value?.trim()
+                    keepWireGuardOnNextConfig = false
+                    preservedWireGuardConfig = null
                     withContext(Dispatchers.IO) {
                         ensureTransportStopped(params.port)
-                    }
-                    withContext(Dispatchers.Main) {
-                        if (config.value != null && params.isSocksMode.not()) {
-                            wgHelper?.reloadTunnel()
+                        if (params.isRawTunMode) {
+                            if (preserveVpn) {
+                                RawTunEngine.prepareForTransportRestart()
+                            } else {
+                                RawTunEngine.prepareForReconnect()
+                            }
+                        } else if (!params.isSocksMode) {
+                            if (preserveVpn) {
+                                keepWireGuardOnNextConfig = true
+                                preservedWireGuardConfig = previousWireGuardConfig
+                            } else {
+                                keepWireGuardOnNextConfig = false
+                                preservedWireGuardConfig = null
+                                wgHelper?.stopTunnel()
+                            }
                         }
                     }
+                    activeWorkers.value = 0
+                    processStartedAtMs = 0L
+                    lastActiveAtMs = 0L
+                    lastStatsReceivedAtMs = 0L
+                    resetTransportTrafficHealth()
+                    markRunning(false)
+                    config.value = null
                     start(context, params, isSwitching = true)
                     startJob?.join()
+                    if (currentParams == null || process == null) return@withLock
+                    if (params.isRawTunMode) {
+                        awaitRawTunReady()
+                    } else if (!params.isSocksMode) {
+                        awaitWireGuardReady()
+                    }
                 } catch (e: CancellationException) {
                     transportRestartInProgress = false
                     throw e
                 } catch (e: Exception) {
-                    handleReconnectFailed(e.message ?: e::class.java.simpleName)
+                    handleSwitchingStartFailed(e.message ?: e::class.java.simpleName)
                 } finally {
+                    preserveVpnDuringReconnect = false
                     transportRestartInProgress = false
                     isReconnecting.value = false
                 }
@@ -1305,22 +1429,44 @@ object TunnelManager {
     }
 
     fun resume() {
-        val resumeCtx = lastContext?.get()
-        if (currentParams != null && resumeCtx != null) {
-            scope.launch {
-                isReconnecting.value = true
-                try {
-                    withContext(Dispatchers.Main) {
-                        if (config.value != null && currentParams?.isSocksMode != true) {
-                            wgHelper?.reloadTunnel()
-                        }
-                    }
-                    start(resumeCtx, currentParams!!, isSwitching = true)
-                } finally {
-                    isReconnecting.value = false
-                }
+        restartTransport("сеть появилась", force = true)
+    }
+
+    private fun resetTransportTrafficHealth() {
+        lastUplinkMb = 0.0
+        lastDownlinkMb = 0.0
+        lastUplinkChangedAtMs = 0L
+        lastDownlinkChangedAtMs = 0L
+    }
+
+    private suspend fun awaitRawTunReady(timeoutMs: Long = 20_000L) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (RawTunEngine.running) return
+            val proc = process
+            if (proc == null || !proc.isAlive) {
+                error("RAW: go_client завершился до подъёма TUN")
             }
+            delay(100)
         }
+        error("RAW TUN не поднялся за ${timeoutMs / 1000} с")
+    }
+
+    private suspend fun awaitWireGuardReady(timeoutMs: Long = 20_000L) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            when (wgHelper?.watchdogState()) {
+                WireGuardHelper.WatchdogState.UP,
+                WireGuardHelper.WatchdogState.DISABLED_BY_EMPTY_WHITELIST -> return
+                else -> Unit
+            }
+            val proc = process
+            if (proc == null || !proc.isAlive) {
+                error("WireGuard: go_client завершился до подъёма VPN")
+            }
+            delay(100)
+        }
+        error("WireGuard VPN не поднялся за ${timeoutMs / 1000} с")
     }
 
     // Убивает процесс без изменения running
@@ -1750,8 +1896,11 @@ object TunnelManager {
     private fun isAccountVkAuthActive(): Boolean =
         currentParams?.vkAuthMode?.equals("anonymous", ignoreCase = true) == false
 
-    private fun pipelineTimeoutFor(step: ConnectionStep): Long =
-        if (step == ConnectionStep.VK) PIPELINE_VK_STEP_TIMEOUT_MS else PIPELINE_STEP_TIMEOUT_MS
+    private fun pipelineTimeoutFor(step: ConnectionStep): Long = when (step) {
+        ConnectionStep.VK -> PIPELINE_VK_STEP_TIMEOUT_MS
+        ConnectionStep.RAW -> PIPELINE_RAW_STEP_TIMEOUT_MS
+        else -> PIPELINE_STEP_TIMEOUT_MS
+    }
 
     private fun armPipelineStepTimeout(step: ConnectionStep?) {
         cancelPipelineStepTimeout()
@@ -1989,6 +2138,9 @@ data class TunnelParams(
     val obfsMode: String = "audio", // "audio" or "video"
     val connectionMode: String = SettingsStore.CONNECTION_MODE_VPN, // vpn | socks | box
     val socksPort: Int = SettingsStore.DEFAULT_SOCKS_PORT,
+    val socksAuthEnabled: Boolean = false,
+    val socksUsername: String = "",
+    val socksPassword: String = "",
     /** Экспериментально: RTP-obfs AEAD без DTLS. Нужен сервер с -listen-direct, peer уже должен указывать на direct-порт. */
     val noDtls: Boolean = false,
     /** TURN-relay по TCP вместо UDP — обход UDP-душения на некоторых сетях (напр. Ростелеком). */

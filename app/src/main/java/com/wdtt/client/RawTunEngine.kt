@@ -22,6 +22,11 @@ object RawTunEngine {
     private const val TAG = "RawTunEngine"
     private val mutex = Mutex()
 
+    private var activeIp = ""
+    private var activeDnsCsv = ""
+    private var activeMtu = 0
+    private var reuseTunOnNextStart = false
+
     @Volatile
     var running: Boolean = false
         private set
@@ -55,10 +60,27 @@ object RawTunEngine {
                 }
                 diag("RawTunVpnService instance obtained")
 
-                val pfd = vpn.establish(ip, dnsCsv, mtu)
-                running = true
-                diag("Builder.establish() returned pfd, fd=${pfd.fd}")
-                TunnelManager.addNetworkLog("[RAW] TUN поднят (ip=$ip, mtu=$mtu), жду go_client…")
+                val existingTun = vpn.currentTunFd()
+                val canReuseTun = reuseTunOnNextStart &&
+                    existingTun?.fileDescriptor?.valid() == true &&
+                    activeIp == ip &&
+                    activeDnsCsv == dnsCsv &&
+                    activeMtu == mtu
+                reuseTunOnNextStart = false
+
+                val pfd = if (canReuseTun) {
+                    val reusableTun = requireNotNull(existingTun)
+                    diag("Повторно используем действующий RAW TUN fd=${reusableTun.fd}")
+                    reusableTun
+                } else {
+                    vpn.establish(ip, dnsCsv, mtu).also {
+                        activeIp = ip
+                        activeDnsCsv = dnsCsv
+                        activeMtu = mtu
+                        diag("Builder.establish() returned pfd, fd=${it.fd}")
+                        TunnelManager.addNetworkLog("[RAW] TUN поднят (ip=$ip, mtu=$mtu), жду go_client…")
+                    }
+                }
 
                 // Блокируется до подключения go_client — тот уже печатает
                 // "[RAW] Ожидание TUN fd..." и переподключается сам, так что
@@ -66,11 +88,16 @@ object RawTunEngine {
                 try {
                     diag("TunFdBridge.sendOnce(sockName=$sockName) — waiting for go_client to connect and receive fd...")
                     TunFdBridge.sendOnce(sockName, pfd)
+                    running = true
                     diag("TunFdBridge.sendOnce() returned OK — fd handed off to go_client")
                     TunnelManager.addNetworkLog("[RAW] TUN fd передан в go_client")
                 } catch (e: Exception) {
                     diag("TunFdBridge.sendOnce() THREW: ${e.javaClass.simpleName}: ${e.message}", isError = true)
                     running = false
+                    activeIp = ""
+                    activeDnsCsv = ""
+                    activeMtu = 0
+                    vpn.closeTun()
                     throw e
                 }
             }
@@ -94,14 +121,42 @@ object RawTunEngine {
         withContext(Dispatchers.IO) { stopLocked(context) }
     }
 
+    suspend fun prepareForReconnect() = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            running = false
+            reuseTunOnNextStart = false
+            activeIp = ""
+            activeDnsCsv = ""
+            activeMtu = 0
+            RawTunVpnService.instance?.closeTun()
+            diag("RAW TUN закрыт перед переподключением")
+        }
+    }
+
+    suspend fun prepareForTransportRestart() = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            running = false
+            reuseTunOnNextStart = RawTunVpnService.instance?.currentTunFd()?.fileDescriptor?.valid() == true
+            diag("RAW TUN сохранён для мягкого перезапуска транспорта")
+        }
+    }
+
     fun onVpnRevoked() {
         running = false
+        reuseTunOnNextStart = false
+        activeIp = ""
+        activeDnsCsv = ""
+        activeMtu = 0
         RawTunVpnService.instance?.closeTun()
         TunnelManager.addNetworkLog("[RAW] VPN отозван системой")
     }
 
     private fun stopLocked(context: Context) {
         running = false
+        reuseTunOnNextStart = false
+        activeIp = ""
+        activeDnsCsv = ""
+        activeMtu = 0
         RawTunVpnService.instance?.closeTun()
         runCatching {
             context.applicationContext.stopService(

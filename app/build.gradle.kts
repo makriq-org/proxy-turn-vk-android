@@ -7,6 +7,14 @@ plugins {
 }
 
 android {
+    val targetAbis = providers.gradleProperty("targetAbis")
+        .orNull
+        ?.split(',')
+        ?.map { it.trim() }
+        ?.filter { it.isNotEmpty() }
+        ?.ifEmpty { null }
+        ?: listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+
     namespace = "com.wdtt.client"   
     compileSdk = 35
     
@@ -14,25 +22,22 @@ android {
         applicationId = "net.qwdtt.client"
         minSdk = 28
         targetSdk = 35
-        versionCode = 38
-        versionName = "1.4"
+        versionCode = 39
+        versionName = "1.4.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
         }
 
-        ndk {
-            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
-        }
     }
 
     splits {
         abi {
             isEnable = true
             reset()
-            include("arm64-v8a", "armeabi-v7a", "x86_64")
-            isUniversalApk = true
+            include(*targetAbis.toTypedArray())
+            isUniversalApk = targetAbis.size > 1
         }
     }
 
@@ -131,6 +136,11 @@ tasks.register<Exec>("buildNativeLibs") {
     description = "Build Go client binaries for Android ABIs and copy them into app/src/main/jniLibs"
     workingDir = rootDir
     commandLine("bash", rootDir.resolve("scripts/build-native-libs.sh").absolutePath)
+    environment(
+        "TARGET_ABIS",
+        providers.gradleProperty("targetAbis").orNull?.replace(',', ' ')
+            ?: "arm64-v8a armeabi-v7a x86_64",
+    )
 }
 
 tasks.named("preBuild").configure {
