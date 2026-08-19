@@ -49,6 +49,8 @@ import (
 const (
 	wgIfaceName           = "wdtt0"
 	wgServerAddr          = "10.66.66.1"
+	wgClientAddr          = "10.66.66.2"
+	wgClientCIDR          = wgClientAddr + "/32"
 	wgServerCIDR          = wgServerAddr + "/16"
 	defaultInternalWGPort = 56001
 	wgMTU                 = 1280
@@ -222,6 +224,18 @@ func getPublicIP() string {
 	publicIP = string(bytes.TrimSpace(ipBytes))
 	return publicIP
 }
+
+func stripVkUrl(url string) string {
+	url = strings.TrimSpace(url)
+	if idx := strings.LastIndex(url, "/"); idx != -1 {
+		url = url[idx+1:]
+	}
+	if idx := strings.Index(url, "?"); idx != -1 {
+		url = url[:idx]
+	}
+	return strings.TrimSpace(url)
+}
+
 
 type wrapKeyEntry struct {
 	id  string
@@ -3124,7 +3138,10 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 	proxyWg.Wait()
 }
 
-const wrapKeyLen = 32
+const (
+	wrapNonceLen = 12
+	wrapKeyLen   = 32
+)
 
 // ==================== RTP Обфускация ====================
 
